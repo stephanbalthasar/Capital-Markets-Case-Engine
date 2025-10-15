@@ -1,5 +1,6 @@
 import streamlit as st
 from sentence_transformers import SentenceTransformer, util
+import re
 
 # Load the sentence transformer model
 @st.cache_resource
@@ -9,27 +10,30 @@ def load_model():
 model = load_model()
 
 # Hidden model answer (not shown to students)
-MODEL_ANSWER = """
-Under the Market Abuse Regulation, the issuer must disclose inside information as soon as possible unless a delay is justified. The issuance of convertible bonds may constitute inside information depending on its impact on the price of the securities.
-"""
+MODEL_ANSWER = """[Insert your detailed model answer here]"""
 
-# Streamlit UI setup
+# Streamlit UI
 st.set_page_config(page_title="Capital Markets Law Practice", layout="centered")
 st.title("📘 Capital Markets Law Case Practice")
 
-# Case text with numbering and line break before "Questions"
-case_text = """
-1. A listed company intends to issue convertible bonds in Germany.
-2. The bonds will be offered to institutional investors only.
-3. The company is already subject to EU disclosure obligations.
+st.markdown("### 🧾 Case:")
+st.markdown("""
+Problem:
+1. Neon AG is a German stock company...
+2. Unicorn will transfer the licences...
+3. Gerry agrees to follow Unicorn’s instructions...
+
+---
 
 Questions:
 
-What disclosure obligations apply under the Market Abuse Regulation?
-"""
+1. Does the conclusion of the CFA trigger capital market disclosure obligations for Neon?
+2. Does this require a prospectus under the Prospectus Regulation?
+3. What are the disclosure obligations for Unicorn?
 
-st.markdown("### 🧾 Case:")
-st.markdown(case_text)
+Note:
+You may assume all corporate authorisations are in place.
+""")
 
 # Text area for student input
 student_answer = st.text_area("✍️ Your Answer", height=250)
@@ -41,23 +45,29 @@ if st.button("🧠 Get Feedback"):
         embeddings = model.encode([student_answer, MODEL_ANSWER], convert_to_tensor=True)
         similarity = util.pytorch_cos_sim(embeddings[0], embeddings[1]).item()
 
-        # Generate detailed feedback based on similarity score
+        # Extract key legal concepts from model answer
+        key_concepts = re.findall(r'\b(?:article|§{1,2})\s[\d\w\(\)]+(?:\s(?:MAR|PR|WpHG|WpÜG|MiFID II))?', MODEL_ANSWER, flags=re.IGNORECASE)
+        key_concepts = list(set(key_concepts))
+
+        # Check which concepts are present in student answer
+        present_concepts = [concept for concept in key_concepts if concept.lower() in student_answer.lower()]
+        missing_concepts = [concept for concept in key_concepts if concept.lower() not in student_answer.lower()]
+
+        # Generate detailed feedback
+        feedback = f"🔍 Similarity Score: {similarity:.2f}\n\n"
+        feedback += "✅ Concepts you covered:\n"
+        feedback += "\n".join(f"- {c}" for c in present_concepts) if present_concepts else "None detected."
+
+        feedback += "\n\n❌ Concepts you may have missed:\n"
+        feedback += "\n".join(f"- {c}" for c in missing_concepts) if missing_concepts else "None. Excellent coverage!"
+
+        feedback += "\n\n🧠 Overall Feedback:\n"
         if similarity > 0.8:
-            feedback = (
-                "✅ Your answer is very close to the model solution. You correctly identified the issuer's obligation to disclose inside information promptly. "
-                "You also recognized that the issuance of convertible bonds may qualify as inside information depending on its market impact. Excellent work!"
-            )
+            feedback += "Your answer demonstrates strong alignment with the model solution and covers most key legal concepts. Excellent work!"
         elif similarity > 0.5:
-            feedback = (
-                "🟡 Your answer covers some key points, such as the issuer's disclosure duties. However, it could be improved by explicitly referencing the Market Abuse Regulation, "
-                "and explaining how the issuance of convertible bonds might constitute inside information. Consider elaborating on the timing and conditions for disclosure."
-            )
+            feedback += "Your answer shows partial alignment with the model solution. Consider elaborating on the missing legal provisions and their implications."
         else:
-            feedback = (
-                "🔴 Your answer misses several important aspects. Under the Market Abuse Regulation, issuers must disclose inside information as soon as possible unless a delay is justified. "
-                "You should also consider whether the issuance of convertible bonds could affect the price of the securities, which may trigger disclosure obligations. "
-                "Please review the regulation and refine your analysis."
-            )
+            feedback += "Your answer lacks alignment with the model solution. Please review the relevant legal frameworks and ensure you address the disclosure obligations and regulatory requirements in detail."
 
         st.markdown("### 📋 Feedback:")
         st.info(feedback)
