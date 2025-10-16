@@ -22,6 +22,54 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import requests
 from bs4 import BeautifulSoup
 
+import requests
+import streamlit as st
+
+# ---------------- Openrouter connectivity test ----------------
+def test_openrouter_connectivity(api_key: str):
+    st.subheader("🔌 OpenRouter connectivity test")
+    if not api_key:
+        st.error("No API key found (OPENROUTER_API_KEY). Add it to Streamlit Secrets.")
+        return
+
+    try:
+        r = requests.get(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=20
+        )
+        st.write("GET /models →", r.status_code)
+        st.code((r.text or "")[:800], language="json")
+        if r.status_code != 200:
+            st.warning("Non-200 response from /models. Check the key, subscription, or try again later.")
+            return
+    except Exception as e:
+        st.exception(e)
+        return
+
+    # Minimal chat roundtrip
+    payload = {
+        "model": "meta-llama/llama-3.1-70b-instruct",
+        "messages": [{"role": "user", "content": "Say: Hello from Neon Case Tutor"}],
+        "max_tokens": 32,
+        "temperature": 0.0,
+    }
+    try:
+        r2 = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30
+        )
+        st.write("POST /chat/completions →", r2.status_code)
+        st.code((r2.text or "")[:800], language="json")
+    except Exception as e:
+        st.exception(e)
+
+
 # ---------------- Build fingerprint ----------------
 APP_HASH = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:10]
 
