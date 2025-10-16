@@ -499,6 +499,12 @@ with st.sidebar:
     max_sources = st.slider("Max sources to cite", 3, 10, 6, 1)
     st.caption("Searches DuckDuckGo HTML; filters to EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet, BGH.")
 
+    # ---- DIAGNOSTICS (add this) ----
+    st.divider()
+    st.subheader("Diagnostics")
+    if st.checkbox("Run OpenRouter connectivity test"):
+        test_openrouter_connectivity(api_key)
+
 st.subheader("📝 Your Answer")
 student_answer = st.text_area("Write your solution here (≥ ~120 words).", height=260)
 
