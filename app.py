@@ -1,10 +1,10 @@
 # app.py
 # Neon Case Tutor — Web‑Grounded Feedback & Chatbot (OpenRouter + RAG)
-# - Robust legal citation matching (e.g., "§ 33(1) WpHG" matches "§ 33 WpHG")
+# - Robust citation matching (e.g., "§ 33(1) WpHG" matches "§ 33 WpHG")
 # - Mis-citation detector (Art 3(1) PR -> Art 3(3) PR; § 40 WpHG -> § 43(1) WpHG)
 # - Substantive flag for Art 17(4) MAR delay claims
 # - Reads OPENROUTER_API_KEY from Streamlit secrets/env
-# - Build fingerprint for quick verification
+# - Build fingerprint to verify the deployed version
 
 import os
 import re
@@ -22,7 +22,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import requests
 from bs4 import BeautifulSoup
 
-# ---------------- Build fingerprint (verify latest deployment) ----------------
+# ---------------- Build fingerprint ----------------
 APP_HASH = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:10]
 
 # ---------------- Embeddings ----------------
@@ -135,19 +135,15 @@ def canonicalize(s: str, strip_paren_numbers: bool = False) -> str:
     s = s.replace("wpüg", "wpüg")  # normalize umlaut edge-case
     s = re.sub(r"\s+", "", s)
     if strip_paren_numbers:
-        # remove (1), (2a) etc.
-        s = re.sub(r"\(\d+[a-z]?\)", "", s)
-    # keep only letters, digits, and §
+        s = re.sub(r"\(\d+[a-z]?\)", "", s)  # remove (1), (2a), ...
     s = re.sub(r"[^a-z0-9§]", "", s)
     return s
 
 def keyword_present(answer: str, kw: str) -> bool:
-    # Legal citations via canonical forms: strip parentheses from the TEXT side
     ans_can_strip = canonicalize(answer, strip_paren_numbers=True)
     kw_can_strip = canonicalize(kw, strip_paren_numbers=True)
     if kw.strip().lower().startswith(("§", "art")):
         return kw_can_strip in ans_can_strip
-    # General phrase fallback
     hay = " " + normalize_ws(answer).lower() + " "
     needle = normalize_ws(kw).lower()
     return needle in hay
@@ -160,17 +156,12 @@ def coverage_score(answer: str, issue: Dict) -> Tuple[int, List[str]]:
 def detect_citation_issues(answer: str) -> Dict[str, List[str]]:
     issues, suggestions = [], []
     a = answer
-
-    # PR Art 3(1) vs 3(3) for admission to trading
     if re.search(r"\bart\.?\s*3\s*\(\s*1\s*\)\s*(pr|prospectus)", a, flags=re.IGNORECASE):
         issues.append("You cited **Art 3(1) PR** for admission to trading (public‑offer rule).")
         suggestions.append("For admission to a regulated market, cite **Art 3(3) PR**; also **Art 20/21 PR** on approval/publication.")
-
-    # § 40 WpHG vs § 43(1) WpHG (statement of intent)
     if re.search(r"§\s*40\s*wphg", a, flags=re.IGNORECASE):
         issues.append("You cited **§ 40 WpHG**. The **statement of intent** is **§ 43(1) WpHG**.")
-        suggestions.append("Replace **§ 40 WpHG** with **§ 43(1) WpHG** for the statement of intent.")
-
+        suggestions.append("Replace **§ 40 WpHG** with **§ 43(1) WpHG**.")
     return {"issues": issues, "suggestions": suggestions}
 
 def detect_substantive_flags(answer: str) -> List[str]:
@@ -219,12 +210,12 @@ def summarize_rubric(student_answer: str, model_answer: str, backend, required_i
 
 # ---------------- Web Retrieval (RAG) ----------------
 ALLOWED_DOMAINS = {
-    "eur-lex.europa.eu",         # EU law (MAR, PR, TD, MiFID II)
-    "curia.europa.eu",           # CJEU (e.g., Lafonta C‑628/13)
-    "www.esma.europa.eu",        # ESMA guidelines & Q&A
-    "www.bafin.de",              # BaFin guidance
-    "www.gesetze-im-internet.de","gesetze-im-internet.de",  # German statutes (WpHG, WpÜG)
-    "www.bundesgerichtshof.de",  # BGH
+    "eur-lex.europa.eu",
+    "curia.europa.eu",
+    "www.esma.europa.eu",
+    "www.bafin.de",
+    "www.gesetze-im-internet.de", "gesetze-im-internet.de",
+    "www.bundesgerichtshof.de",
 }
 
 SEED_URLS = [
@@ -232,15 +223,13 @@ SEED_URLS = [
     "https://eur-lex.europa.eu/eli/reg/2017/1129/oj",  # Prospectus Regulation
     "https://eur-lex.europa.eu/eli/dir/2014/65/oj",    # MiFID II
     "https://eur-lex.europa.eu/eli/dir/2004/109/oj",   # Transparency Directive
-    "https://curia.europa.eu/juris/liste.jsf?num=C-628/13",  # Lafonta (specificity, Art 7(2) MAR)
+    "https://curia.europa.eu/juris/liste.jsf?num=C-628/13",  # Lafonta
     "https://www.gesetze-im-internet.de/wphg/",
     "https://www.gesetze-im-internet.de/wpu_g/",
     "https://www.esma.europa.eu/press-news/esma-news/esma-finalises-guidelines-delayed-disclosure-inside-information-under-mar",
 ]
 
-UA = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-}
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def duckduckgo_search(query: str, max_results: int = 6) -> List[Dict]:
@@ -429,8 +418,6 @@ with st.expander("📚 Case (click to read)"):
 
 with st.sidebar:
     st.header("⚙️ Settings")
-
-    # Secrets/env
     key_from_secrets = st.secrets.get("OPENROUTER_API_KEY", None) if hasattr(st, "secrets") else None
     key_from_env = os.getenv("OPENROUTER_API_KEY")
     api_key = key_from_secrets or key_from_env
@@ -501,7 +488,7 @@ with colA:
                     miss = [kw for kw in row["keywords_total"] if kw not in row["keywords_hit"]]
                     st.markdown(f"- ⛔ Missing: {', '.join(miss) if miss else '—'}")
 
-            # Deterministic corrections (always shown)
+            # Deterministic corrections
             if rubric["citation_issues"]["issues"] or rubric["substantive_flags"]:
                 st.markdown("### 🛠️ Detected corrections")
                 for it in rubric["citation_issues"]["issues"]:
@@ -511,7 +498,7 @@ with colA:
                 for fl in rubric["substantive_flags"]:
                     st.markdown(f"- ⚖️ {fl}")
 
-            # Sources for LLM
+            # Sources & excerpts for LLM
             sources_block = "\n".join(source_lines) if source_lines else "(no web sources available)"
             excerpts_items = []
             for i, tp in enumerate(top_pages):
@@ -554,6 +541,45 @@ with colB:
         with st.spinner("Retrieving sources and drafting a grounded reply..."):
             backend = load_embedder()
             if enable_web:
+                # SAFE concatenation (prevents unterminated string literal errors)
+                query_for_snippets = "\n\n".join([student_answer or "", user_q or ""])
                 pages = collect_corpus(student_answer, user_q, max_fetch=20)
                 top_pages, source_lines = retrieve_snippets(
-                    student_answer + "\n
+                    query_for_snippets, MODEL_ANSWER, pages, backend, top_k_pages=max_sources, chunk_words=170
+                )
+            else:
+                top_pages, source_lines = [], []
+            sources_block = "\n".join(source_lines) if source_lines else "(no web sources available)"
+            excerpts_items = []
+            for i, tp in enumerate(top_pages):
+                for sn in tp["snippets"]:
+                    excerpts_items.append(f"[{i+1}] {sn}")
+            excerpts_block = "\n\n".join(excerpts_items[: max_sources * 3]) if excerpts_items else "(no excerpts)"
+
+            st.session_state.chat_history.append({"role": "user", "content": user_q})
+            if api_key:
+                msgs = [{"role": "system", "content": system_guardrails()}]
+                msgs.extend([m for m in st.session_state.chat_history if m["role"] in ("user", "assistant")][-8:])
+                msgs.append({"role": "system", "content": "MODEL ANSWER (authoritative):\n" + MODEL_ANSWER})
+                msgs.append({"role": "system", "content": "SOURCES:\n" + sources_block})
+                msgs.append({"role": "system", "content": "RELEVANT EXCERPTS:\n" + excerpts_block})
+                reply = call_openrouter(msgs, api_key, model_name=model_name, temperature=temp, max_tokens=600)
+            else:
+                reply = None
+
+            if not reply:
+                reply = (
+                    "I couldn’t reach the LLM. Here are the most relevant source snippets:\n\n"
+                    + (excerpts_block if excerpts_block != "(no excerpts)" else "— no sources available —")
+                    + "\n\nIn doubt, follow the model answer."
+                )
+
+            with st.chat_message("assistant"):
+                st.write(reply)
+            st.session_state.chat_history.append({"role": "assistant", "content": reply})
+
+st.divider()
+st.markdown(
+    "ℹ️ **Notes**: The app grounds answers in authoritative sources and the hidden model answer. "
+    "If web sources appear to diverge, the tutor explains the divergence but follows the model answer."
+)
