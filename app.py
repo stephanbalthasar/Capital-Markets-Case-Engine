@@ -4,7 +4,7 @@
 # - Mis-citation detector (Art 3(1) PR -> Art 3(3) PR; § 40 WpHG -> § 43(1) WpHG)
 # - Substantive flag for Art 17(4) MAR delay claims
 # - Reads OPENROUTER_API_KEY from Streamlit secrets/env
-# - Build fingerprint to verify the deployed version
+# - Build fingerprint + diagnostics to surface LLM errors
 
 import os
 import re
@@ -22,10 +22,10 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import requests
 from bs4 import BeautifulSoup
 
-import requests
-import streamlit as st
+# ---------------- Build fingerprint (verify latest deployment) ----------------
+APP_HASH = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:10]
 
-# ---------------- Openrouter connectivity test ----------------
+# ---------------- Optional: OpenRouter connectivity test ----------------
 def test_openrouter_connectivity(api_key: str):
     st.subheader("🔌 OpenRouter connectivity test")
     if not api_key:
@@ -36,18 +36,18 @@ def test_openrouter_connectivity(api_key: str):
         r = requests.get(
             "https://openrouter.ai/api/v1/models",
             headers={"Authorization": f"Bearer {api_key}"},
-            timeout=20
+            timeout=20,
         )
         st.write("GET /models →", r.status_code)
-        st.code((r.text or "")[:800], language="json")
+        st.code((r.text or "")[:1000], language="json")
         if r.status_code != 200:
-            st.warning("Non-200 response from /models. Check the key, subscription, or try again later.")
+            st.warning("Non-200 from /models. Check key/plan or try another model.")
             return
     except Exception as e:
         st.exception(e)
         return
 
-    # Minimal chat roundtrip
+    # Minimal chat round-trip
     payload = {
         "model": "meta-llama/llama-3.1-70b-instruct",
         "messages": [{"role": "user", "content": "Say: Hello from Neon Case Tutor"}],
@@ -62,16 +62,12 @@ def test_openrouter_connectivity(api_key: str):
                 "Content-Type": "application/json",
             },
             json=payload,
-            timeout=30
+            timeout=30,
         )
         st.write("POST /chat/completions →", r2.status_code)
-        st.code((r2.text or "")[:800], language="json")
+        st.code((r2.text or "")[:1000], language="json")
     except Exception as e:
         st.exception(e)
-
-
-# ---------------- Build fingerprint ----------------
-APP_HASH = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:10]
 
 # ---------------- Embeddings ----------------
 @st.cache_resource(show_spinner=False)
@@ -87,12 +83,11 @@ def embed_texts(texts: List[str], backend):
     kind, model = backend
     if kind == "sbert":
         return model.encode(texts, normalize_embeddings=True)
-    else:
-        vec = TfidfVectorizer(stop_words="english")
-        X = vec.fit_transform(texts)
-        A = X.toarray()
-        norms = np.linalg.norm(A, axis=1, keepdims=True) + 1e-12
-        return A / norms
+    vec = TfidfVectorizer(stop_words="english")
+    X = vec.fit_transform(texts)
+    A = X.toarray()
+    norms = np.linalg.norm(A, axis=1, keepdims=True) + 1e-12
+    return A / norms
 
 def cos_sim(a, b):
     return float(cosine_similarity(a.reshape(1, -1), b.reshape(1, -1))[0, 0])
@@ -111,17 +106,14 @@ def split_into_chunks(text: str, max_words: int = 200):
 
 # ---------------- Case & Model Answer (YOUR CONTENT) ----------------
 CASE = """Problem:
-
 Neon AG is a German stock company (Aktiengesellschaft), the shares of which have been admitted to trading on the regulated market of the Frankfurt stock exchange for a number of years. Gerry is Neon’s CEO (Vorstandsvorsitzender) and holds 25% of Neon’s shares. Gerry wants Neon to develop a new business strategy. For this, Neon would have to buy IP licences for 2.5 billion euros but has no means to afford this. Unicorn plc is a competitor of Neon’s based in the UK and owns licences of the type needed for Neon’s plans. After confidential negotiations, Unicorn, Neon, and Gerry in his personal capacity enter into a “Cooperation Framework Agreement” (“CFA”) which names all three as parties and which has the following terms:
-1. Unicorn will transfer the licences to Neon by way of a capital contribution in kind (Sacheinlage). In return, Neon will increase its share capital by 30% and issue the new shares to Unicorn. The parties agree that the capital increase should take place within the next 6 months. 
-2. Unicorn and Gerry agree that, once the capital increase is complete, they will pre-align major decisions impacting Neon’s business strategy. Where they cannot agree on a specific measure, Gerry agrees to follow Unicorn’s instructions when voting at a shareholder meeting of Neon.
+1.  Unicorn will transfer the licences to Neon by way of a capital contribution in kind (Sacheinlage). In return, Neon will increase its share capital by 30% and issue the new shares to Unicorn. The parties agree that the capital increase should take place within the next 6 months. 
+2.  Unicorn and Gerry agree that, once the capital increase is complete, they will pre-align major decisions impacting Neon’s business strategy. Where they cannot agree on a specific measure, Gerry agrees to follow Unicorn’s instructions when voting at a shareholder meeting of Neon.
 As a result of the capital increase, Gerry will hold approximately 19% in Neon, and Unicorn 23%. Unicorn, Neon and Gerry know that the agreement will come as a surprise to Neon’s shareholders, in particular, because in previous public statements, Gerry had always stressed that he wanted Neon to remain independent. They expect that the new strategy is a “game-changer” for Neon and will change its strategic orientation permanently in a substantial way. 
-
 Questions:
 1. Does the conclusion of the CFA trigger capital market disclosure obligations for Neon? What is the timeframe for disclosure? Is there an option for Neon to delay disclosure?
 2. Unicorn wants the new shares to be admitted to trading on the regulated market in Frankfurt. Does this require a prospectus under the Prospectus Regulation? What type of information in connection with the CFA would have to be included in such a prospectus?
 3. What are the capital market law disclosure obligations that arise for Unicorn once the capital increase and admission to trading are complete and Unicorn acquires the new shares? Can Unicorn participate in Neon’s shareholder meetings if it does not comply with these obligations?
-
 Note:
 Your answer will not have to consider the SRD, §§ 111a–111c AktG, or EU capital market law that is not included in your permitted material. You may assume that Gerry and Neon have all corporate authorisations for the conclusion of the CFA and the capital increase.
 """
@@ -186,15 +178,17 @@ def canonicalize(s: str, strip_paren_numbers: bool = False) -> str:
     s = s.replace("wpüg", "wpüg")  # normalize umlaut edge-case
     s = re.sub(r"\s+", "", s)
     if strip_paren_numbers:
-        s = re.sub(r"\(\d+[a-z]?\)", "", s)  # remove (1), (2a), ...
+        s = re.sub(r"\(\d+[a-z]?\)", "", s)  # remove (1), (2a) ...
     s = re.sub(r"[^a-z0-9§]", "", s)
     return s
 
 def keyword_present(answer: str, kw: str) -> bool:
+    # Legal citations via canonical forms: strip parentheses from the TEXT side
     ans_can_strip = canonicalize(answer, strip_paren_numbers=True)
     kw_can_strip = canonicalize(kw, strip_paren_numbers=True)
     if kw.strip().lower().startswith(("§", "art")):
         return kw_can_strip in ans_can_strip
+    # General phrase fallback
     hay = " " + normalize_ws(answer).lower() + " "
     needle = normalize_ws(kw).lower()
     return needle in hay
@@ -207,9 +201,11 @@ def coverage_score(answer: str, issue: Dict) -> Tuple[int, List[str]]:
 def detect_citation_issues(answer: str) -> Dict[str, List[str]]:
     issues, suggestions = [], []
     a = answer
+    # PR Art 3(1) vs 3(3) for admission to trading
     if re.search(r"\bart\.?\s*3\s*\(\s*1\s*\)\s*(pr|prospectus)", a, flags=re.IGNORECASE):
         issues.append("You cited **Art 3(1) PR** for admission to trading (public‑offer rule).")
         suggestions.append("For admission to a regulated market, cite **Art 3(3) PR**; also **Art 20/21 PR** on approval/publication.")
+    # § 40 WpHG vs § 43(1) WpHG (statement of intent)
     if re.search(r"§\s*40\s*wphg", a, flags=re.IGNORECASE):
         issues.append("You cited **§ 40 WpHG**. The **statement of intent** is **§ 43(1) WpHG**.")
         suggestions.append("Replace **§ 40 WpHG** with **§ 43(1) WpHG**.")
@@ -393,20 +389,40 @@ def retrieve_snippets(student_answer: str, model_answer: str, pages: List[Dict],
 # ---------------- LLM (OpenRouter) ----------------
 def call_openrouter(messages: List[Dict], api_key: str, model_name: str, temperature: float = 0.2, max_tokens: int = 700) -> str:
     if not api_key:
+        st.error("No OpenRouter API key found (OPENROUTER_API_KEY).")
         return None
+
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://your-streamlit-app.example",  # optional attribution
-        "X-Title": "Neon Case Tutor",
+        # Optional attribution (uncomment and set if you want):
+        # "HTTP-Referer": "https://your-streamlit-app-url",
+        # "X-Title": "Neon Case Tutor",
     }
-    data = {"model": model_name, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
+    data = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+
     try:
         r = requests.post(url, headers=headers, json=data, timeout=60)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
-    except Exception:
+        if r.status_code != 200:
+            try:
+                body = r.json()
+            except Exception:
+                body = r.text
+            st.error(f"OpenRouter error {r.status_code}: {body}")
+            return None
+        j = r.json()
+        return j["choices"][0]["message"]["content"]
+    except requests.exceptions.Timeout:
+        st.error("OpenRouter request timed out (60s). Try again or reduce max_tokens.")
+        return None
+    except requests.exceptions.RequestException as e:
+        st.error(f"OpenRouter request failed: {e}")
         return None
 
 def system_guardrails():
@@ -439,7 +455,8 @@ MODEL ANSWER (AUTHORITATIVE; PREVAILS IN DOUBT):
 \"\"\"{model_answer}\"\"\"
 
 SOURCES:
-{sources_block}
+{s
+ources_block}
 
 EXCERPTS (quote sparingly):
 {excerpts_block}
@@ -460,8 +477,8 @@ def build_chat_prompt(chat_history: List[Dict], model_answer: str, sources_block
     return msgs
 
 # ---------------- UI ----------------
-st.set_page_config(page_title="EuCapML Case Tutor — Web-Grounded Feedback & Chat", page_icon="⚖️", layout="wide")
-st.title("⚖️ EUCapML Case Tutor — Web‑Grounded Feedback & Chatbot")
+st.set_page_config(page_title="Neon Case Tutor — Web-Grounded Feedback & Chat", page_icon="⚖️", layout="wide")
+st.title("⚖️ Neon Case Tutor — Web‑Grounded Feedback & Chatbot")
 st.caption(f"Model answer prevails in doubt. Web sources: EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet.  •  Build: {APP_HASH}")
 
 with st.expander("📚 Case (click to read)"):
@@ -469,6 +486,8 @@ with st.expander("📚 Case (click to read)"):
 
 with st.sidebar:
     st.header("⚙️ Settings")
+
+    # Secrets/env
     key_from_secrets = st.secrets.get("OPENROUTER_API_KEY", None) if hasattr(st, "secrets") else None
     key_from_env = os.getenv("OPENROUTER_API_KEY")
     api_key = key_from_secrets or key_from_env
@@ -499,7 +518,6 @@ with st.sidebar:
     max_sources = st.slider("Max sources to cite", 3, 10, 6, 1)
     st.caption("Searches DuckDuckGo HTML; filters to EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet, BGH.")
 
-    # ---- DIAGNOSTICS (add this) ----
     st.divider()
     st.subheader("Diagnostics")
     if st.checkbox("Run OpenRouter connectivity test"):
@@ -598,7 +616,7 @@ with colB:
         with st.spinner("Retrieving sources and drafting a grounded reply..."):
             backend = load_embedder()
             if enable_web:
-                # SAFE concatenation (prevents unterminated string literal errors)
+                # SAFE concatenation
                 query_for_snippets = "\n\n".join([student_answer or "", user_q or ""])
                 pages = collect_corpus(student_answer, user_q, max_fetch=20)
                 top_pages, source_lines = retrieve_snippets(
