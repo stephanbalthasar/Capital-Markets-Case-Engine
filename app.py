@@ -387,19 +387,26 @@ def retrieve_snippets(student_answer: str, model_answer: str, pages: List[Dict],
     return top_pages, source_lines
 
 # ---------------- LLM (OpenRouter) ----------------
-def call_openrouter(messages: List[Dict], api_key: str, model_name: str, temperature: float = 0.2, max_tokens: int = 700) -> str:
+def call_openrouter(messages: List[Dict], api_key: str, model_name: str,
+                    temperature: float = 0.2, max_tokens: int = 700) -> str:
     if not api_key:
         st.error("No OpenRouter API key found (OPENROUTER_API_KEY).")
         return None
+
+    # Read optional attribution headers from secrets/env
+    referer = (st.secrets.get("OPENROUTER_HTTP_REFERER") if hasattr(st, "secrets") else None) or os.getenv("OPENROUTER_HTTP_REFERER")
+    xtitle  = (st.secrets.get("OPENROUTER_X_TITLE")       if hasattr(st, "secrets") else None) or os.getenv("OPENROUTER_X_TITLE")
 
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        # Optional attribution (uncomment and set if you want):
-        # "HTTP-Referer": "https://your-streamlit-app-url",
-        # "X-Title": "Neon Case Tutor",
     }
+    if referer:
+        headers["HTTP-Referer"] = referer
+    if xtitle:
+        headers["X-Title"] = xtitle
+
     data = {
         "model": model_name,
         "messages": messages,
@@ -410,14 +417,14 @@ def call_openrouter(messages: List[Dict], api_key: str, model_name: str, tempera
     try:
         r = requests.post(url, headers=headers, json=data, timeout=60)
         if r.status_code != 200:
+            # Surface error body so you see the exact cause (401/403/402/429/etc.)
             try:
                 body = r.json()
             except Exception:
                 body = r.text
             st.error(f"OpenRouter error {r.status_code}: {body}")
             return None
-        j = r.json()
-        return j["choices"][0]["message"]["content"]
+        return r.json()["choices"][0]["message"]["content"]
     except requests.exceptions.Timeout:
         st.error("OpenRouter request timed out (60s). Try again or reduce max_tokens.")
         return None
