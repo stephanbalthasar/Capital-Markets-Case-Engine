@@ -413,7 +413,7 @@ def build_chat_prompt(chat_history: List[Dict], model_answer: str, sources_block
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="EuCapML Case Tutor — Web-Grounded Feedback & Chat", page_icon="⚖️", layout="wide")
-st.title("⚖️ Neon Case Tutor — Web‑Grounded Feedback & Chatbot")
+st.title("⚖️ EUCapML Case Tutor — Web‑Grounded Feedback & Chatbot")
 st.caption(f"Model answer prevails in doubt. Web sources: EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet.  •  Build: {APP_HASH}")
 
 with st.expander("📚 Case (click to read)"):
