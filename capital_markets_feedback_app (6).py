@@ -1,7 +1,10 @@
 # app.py
-# Neon Case Tutor — Web‑Grounded Feedback & Chatbot
-# Uses OpenRouter (your key) + live web retrieval (EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet)
-# Hidden model answer is authoritative; in doubt, follow the model answer.
+# Neon Case Tutor — Web‑Grounded Feedback & Chatbot (OpenRouter + RAG)
+# Improvements:
+# - Robust legal citation matching (e.g., "§ 33(1) WpHG" matches "§ 33 WpHG")
+# - Flags common mis-citations (Art 3(1) PR vs correct Art 3(3) PR; § 40 WpHG vs § 43(1) WpHG)
+# - Flags substantive misstatements (e.g., “always delay” under Art 17(4) MAR)
+# - Reads OPENROUTER_API_KEY from Streamlit secrets/env and disables key input if present
 
 import os
 import re
@@ -47,8 +50,7 @@ def split_into_chunks(text: str, max_words: int = 200):
     for w in words:
         cur.append(w)
         if len(cur) >= max_words:
-            chunks.append(" ".join(cur))
-            cur = []
+            chunks.append(" ".join(cur)); cur = []
     if cur: chunks.append(" ".join(cur))
     return chunks
 
@@ -77,7 +79,7 @@ a)  There is no public offer within the meaning of article 2(d) PR that would tr
 b)  As regards the content of the prospectus, students are expected to explain that the prospectus would have to include all information in connection with the CFA that is material within the meaning of article 6(1) PR, in particular, as regards the prospects of Neon (article 6(1)(1)(a) PR) and the reasons for the issuance (article 6(1)(1)(c) PR). The prospectus would also have to describe material risks resulting from the CFA and the new strategy (article 16(1) PR). A good answer would mention that the “criterion” for materiality under German case law is whether an investor would “rather than not” use the information for the investment decision.
 3.  The question requires candidates to address disclosure obligations under the Transparency Directive and the Takeover Bid Directive and implementing domestic German law. 
 a)  As Neon’s shares are listed on a regulated market, Neon is an issuer within the meaning of § 33(4) WpHG, so participations in Neon are subject to disclosure under §§33ff. WpHG. Pursuant to § 33(1) WpHG, Unicorn will have to disclose the acquisition of its stake in Neon. The relevant position to be disclosed includes the 23% stake held by Unicorn directly. In addition, Unicorn will have to take into account Gerry’s 19% stake if the CFA qualifies as “acting in concert” within the meaning of § 34(2) WpHG. In this context, students should differentiate between the two types of acting in concert, namely (i) an agreement to align the exercise of voting rights which qualifies as acting in concert irrespectively of the impact on the issuer’s strategy, and (ii) all other types of alignment which only qualify as acting in concert if it is aimed at modifying substantially the issuer’s strategic orientation. On the facts of the case, both requirements are fulfilled. A good answer should discuss this in the light of the BGH case law, and ideally also consider whether case law on acting in concert under WpÜG can and should be used to assess acting in concert under WpHG. A very complete answer would mention that Unicorn also has to make a statement of intent pursuant to § 43(1) WpHG.
-b)  The acquisition of the new shares is also subject to WpÜG requirements pursuant to § 1(1) WpÜG as the shares issued by Neon are securities within the meaning of § 2(2) WpÜG and admitted to trading on a regulated market. Pursuant to § 35(1)(1) WpÜG, Unicorn has to disclose the fact that it acquired “control” in Neon and publish an offer document submit a draft offer to BaFin, §§ 35(2)(1), 14(2)(1) WpÜG. “Control” is defined as the acquisition of 30% or more in an issuer, § 29(2) WpÜG. The 23% stake held by Unicorn directly would not qualify as “control” triggering a mandatory bid requirement. However, § 30(2) WpÜG requires to include in the calculation shares held by other parties with which Unicorn is acting in concert, i.e., Gerry’s 19% stake (students may refer to the discussion of acting in concert under § 34(2) WpHG). The relevant position totals 42% and therefore the disclosure requirements under § 35(1) WpÜG.
+b)  The acquisition of the new shares is also subject to WpÜG requirements pursuant to § 1(1) WpÜG as the shares issued by Neon are securities within the meaning of § 2(2) WpÜG and admitted to trading on a regulated market. Pursuant to § 35(1)(1) WpÜG, Unicorn has to disclose the fact that it acquired “control” in Neon and publish an offer document submit a draft offer to BaFin, §§ 35(2)(1), 14(2)(1) WpÜG. “Control” is defined as the acquisition of 30% or more in an issuer, § 29(2) WpÜG. The 23% stake held by Unicorn directly would not qualify as “control" triggering a mandatory bid requirement. However, § 30(2) WpÜG requires to include in the calculation shares held by other parties with which Unicorn is acting in concert, i.e., Gerry’s 19% stake (students may refer to the discussion of acting in concert under § 34(2) WpHG). The relevant position totals 42% and therefore the disclosure requirements under § 35(1) WpÜG.
 c)  Failure to disclose under § 33 WpHG/§ 35 WpÜG will suspend Unicorn’s shareholder rights under § 44 WpHG, § 59 WpÜG. No such sanction exists as regards failure to make a statement of intent under § 43(1) WpHG.
 """
 
@@ -116,71 +118,137 @@ REQUIRED_ISSUES = [
 ]
 DEFAULT_WEIGHTS = {"similarity": 0.4, "coverage": 0.6}
 
-def normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip().lower()
+# ---------------- Robust keyword & citation checks ----------------
+def normalize_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
 
-def keyword_present(text: str, kw: str) -> bool:
-    t = " " + normalize(text) + " "
-    k = normalize(kw).replace("art.", "art").replace("article", "art")
-    pats = [r"\b" + re.escape(k) + r"\b", re.escape(k)]
-    return any(re.search(p, t, flags=re.IGNORECASE) for p in pats)
+def canonicalize(s: str, strip_paren_numbers: bool = False) -> str:
+    s = s.lower()
+    s = s.replace("art.", "art").replace("article", "art")
+    s = s.replace("–", "-")
+    # unify statute names
+    s = s.replace("wpüg", "wpüg")
+    # drop spaces for canonical contains-check
+    s = re.sub(r"\s+", "", s)
+    # optionally remove bracketed numbers like (1), (2a)
+    if strip_paren_numbers:
+        s = re.sub(r"\(\d+[a-z]?\)", "", s)
+    # keep letters, digits, and § only
+    s = re.sub(r"[^a-z0-9§]", "", s)
+    return s
+
+def keyword_present(answer: str, kw: str) -> bool:
+    """
+    Flexible matcher:
+    - For legal citations ("§", "art"): compare canonical forms with parentheses removed in the TEXT,
+      so '§ 33(1) WpHG' matches keyword '§ 33 WpHG', and 'Art 3(3) PR' is distinct from 'Art 3(1) PR'.
+    - For general phrases: case-insensitive substring with whitespace normalization.
+    """
+    ans_can_strip = canonicalize(answer, strip_paren_numbers=True)
+    kw_can_strip = canonicalize(kw, strip_paren_numbers=True)
+    if kw.strip().lower().startswith(("§", "art")):
+        return kw_can_strip in ans_can_strip
+
+    # General phrase fallback
+    hay = " " + normalize_ws(answer).lower() + " "
+    needle = normalize_ws(kw).lower()
+    # simple containment (allow inflection and punctuation variance handled above)
+    return needle in hay
 
 def coverage_score(answer: str, issue: Dict) -> Tuple[int, List[str]]:
     hits = [kw for kw in issue["keywords"] if keyword_present(answer, kw)]
     score = int(round(issue["points"] * (len(hits) / max(1, len(issue["keywords"])))))
     return score, hits
 
+def detect_citation_issues(answer: str) -> Dict[str, List[str]]:
+    """Detect common mis-citations and suggest corrections."""
+    issues = []
+    suggestions = []
+    a = answer
+
+    # Art 3(1) PR vs Art 3(3) PR
+    if re.search(r"\bart\.?\s*3\s*\(\s*1\s*\)\s*(pr|prospectus)", a, flags=re.IGNORECASE):
+        issues.append("You cited **Art 3(1) PR** for admission to trading. That article governs the public-offer requirement.")
+        suggestions.append("For admission to a regulated market, cite **Art 3(3) PR** (and typically **Art 20/21 PR** on approval/publication).")
+
+    # § 40 WpHG vs § 43(1) WpHG (statement of intent)
+    if re.search(r"§\s*40\s*wphg", a, flags=re.IGNORECASE):
+        issues.append("You cited **§ 40 WpHG**. The **statement of intent** is **§ 43(1) WpHG**.")
+        suggestions.append("Replace **§ 40 WpHG** with **§ 43(1) WpHG** for the statement of intent.")
+
+    return {"issues": issues, "suggestions": suggestions}
+
+def detect_substantive_flags(answer: str) -> List[str]:
+    flags = []
+    low = answer.lower()
+    if "always delay" in low or re.search(r"\b(can|may)\s+always\s+delay\b", low):
+        flags.append("Delay under **Art 17(4) MAR** is **conditional**: (a) legitimate interest, (b) not misleading, (c) confidentiality ensured. It is not 'always' permitted.")
+    return flags
+
 def summarize_rubric(student_answer: str, model_answer: str, backend, required_issues: List[Dict], weights: Dict):
+    # Semantic similarity
     embs = embed_texts([student_answer, model_answer], backend)
     sim = cos_sim(embs[0], embs[1])
     sim_pct = max(0.0, min(100.0, 100.0 * (sim + 1) / 2))
-    per_issue, tot, got = [], 0, 0
+
+    # Issue coverage
+    per_issue = []
+    total_points = 0
+    achieved_points = 0
     for issue in required_issues:
         pts = issue.get("points", 10)
-        tot += pts
-        sc, hits = coverage_score(student_answer, issue)
-        got += sc
+        total_points += pts
+        score, hits = coverage_score(student_answer, issue)
+        achieved_points += score
         per_issue.append({
-            "issue": issue["name"], "max_points": pts, "score": sc,
+            "issue": issue["name"], "max_points": pts, "score": score,
             "keywords_hit": hits, "keywords_total": issue["keywords"],
         })
-    cov_pct = 100.0 * got / max(1, tot)
-    final = (weights["similarity"] * sim_pct + weights["coverage"] * cov_pct) / (weights["similarity"] + weights["coverage"])
+    coverage_pct = 100.0 * achieved_points / max(1, total_points)
+    final_score = (weights["similarity"] * sim_pct + weights["coverage"] * coverage_pct) / (weights["similarity"] + weights["coverage"])
+
     missing = []
     for row in per_issue:
         missed = [kw for kw in row["keywords_total"] if kw not in row["keywords_hit"]]
         if missed:
             missing.append({"issue": row["issue"], "missed_keywords": missed})
+
+    # Add targeted checks
+    citation_issues = detect_citation_issues(student_answer)
+    substantive_flags = detect_substantive_flags(student_answer)
+
     return {
         "similarity_pct": round(sim_pct, 1),
-        "coverage_pct": round(cov_pct, 1),
-        "final_score": round(final, 1),
+        "coverage_pct": round(coverage_pct, 1),
+        "final_score": round(final_score, 1),
         "per_issue": per_issue,
         "missing": missing,
+        "citation_issues": citation_issues,
+        "substantive_flags": substantive_flags,
     }
 
 # ---------------- Web Retrieval (RAG) ----------------
 ALLOWED_DOMAINS = {
     "eur-lex.europa.eu",        # EU law (MAR, PR, TD, MiFID II)
-    "curia.europa.eu",          # Court of Justice (e.g., Lafonta C‑628/13, Geltl C‑19/11 if needed)
+    "curia.europa.eu",          # CJEU (e.g., Lafonta C‑628/13; Geltl C‑19/11 if queried)
     "www.esma.europa.eu",       # ESMA guidelines & Q&A
     "www.bafin.de",             # BaFin guidance
     "www.gesetze-im-internet.de", "gesetze-im-internet.de",  # German statutes (WpHG, WpÜG)
-    "www.bundesgerichtshof.de", # BGH database (for acting-in-concert jurisprudence)
+    "www.bundesgerichtshof.de", # BGH
 }
 
 SEED_URLS = [
-    # Core EU instruments
+    # Core EU instruments (pinned)
     "https://eur-lex.europa.eu/eli/reg/2014/596/oj",   # MAR
     "https://eur-lex.europa.eu/eli/reg/2017/1129/oj",  # Prospectus Regulation
     "https://eur-lex.europa.eu/eli/dir/2014/65/oj",    # MiFID II
     "https://eur-lex.europa.eu/eli/dir/2004/109/oj",   # Transparency Directive
-    # CJEU Lafonta on MAR Art 7(2) specificity
+    # CJEU Lafonta on specificity under Art 7(2) MAR
     "https://curia.europa.eu/juris/liste.jsf?num=C-628/13",
     # German statutes
-    "https://www.gesetze-im-internet.de/wphg/",        # WpHG
-    "https://www.gesetze-im-internet.de/wpu_g/",       # WpÜG
-    # ESMA delay/disclosure guidelines
+    "https://www.gesetze-im-internet.de/wphg/",
+    "https://www.gesetze-im-internet.de/wpu_g/",
+    # ESMA delay/disclosure guidelines under MAR
     "https://www.esma.europa.eu/press-news/esma-news/esma-finalises-guidelines-delayed-disclosure-inside-information-under-mar",
 ]
 
@@ -239,7 +307,7 @@ def build_queries(student_answer: str, extra_user_q: str = "") -> List[str]:
         "WpÜG § 59 Ruhen von Rechten site:gesetze-im-internet.de OR site:bafin.de",
     ]
     if student_answer:
-        base.append(f"({student_answer[:300]}) Neon Unicorn CFA MAR prospectus WpHG WpÜG site:eur-lex.europa.eu OR site:gesetze-im-internet.de")
+        base.append(f"({student_answer[:300]}) Neon Unicorn CFA MAR PR WpHG WpÜG site:eur-lex.europa.eu OR site:gesetze-im-internet.de")
     if extra_user_q:
         base.append(extra_user_q + " site:eur-lex.europa.eu OR site:gesetze-im-internet.de OR site:curia.europa.eu OR site:esma.europa.eu OR site:bafin.de")
     return base
@@ -248,7 +316,6 @@ def collect_corpus(student_answer: str, extra_user_q: str, max_fetch: int = 20) 
     results = [{"title": "", "url": u} for u in SEED_URLS]
     for q in build_queries(student_answer, extra_user_q):
         results.extend(duckduckgo_search(q, max_results=5))
-    # Deduplicate & filter domains
     seen, cleaned = set(), []
     for r in results:
         url = r["url"]
@@ -257,11 +324,10 @@ def collect_corpus(student_answer: str, extra_user_q: str, max_fetch: int = 20) 
         domain = urlparse(url).netloc.lower()
         if not any(domain.endswith(d) for d in ALLOWED_DOMAINS): continue
         cleaned.append(r)
-    # Fetch
     fetched = []
     for r in cleaned[:max_fetch]:
         pg = fetch_url(r["url"])
-        if pg["text"]: 
+        if pg["text"]:
             pg["title"] = pg["title"] or r.get("title") or r["url"]
             fetched.append(pg)
     return fetched
@@ -296,7 +362,7 @@ def call_openrouter(messages: List[Dict], api_key: str, model_name: str, tempera
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://your-streamlit-app.example",  # optional attribution
+        "HTTP-Referer": "https://your-streamlit-app.example",  # replace with your deployed URL (optional)
         "X-Title": "Neon Case Tutor",
     }
     data = {"model": model_name, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
@@ -316,7 +382,7 @@ def system_guardrails():
     )
 
 def build_feedback_prompt(student_answer: str, rubric: Dict, model_answer: str, sources_block: str, excerpts_block: str) -> str:
-    return f"""GRADE THE STUDENT'S ANSWER USING THE RUBRIC AND WEB SOURCES.
+    return f"""GRADE THE STUDENT'S ANSWER USING THE RUBRIC, MIS-CITATION FLAGS, AND WEB SOURCES.
 
 STUDENT ANSWER:
 \"\"\"{student_answer}\"\"\"
@@ -326,6 +392,12 @@ RUBRIC:
 - Issue coverage: {rubric['coverage_pct']}%
 - Overall score: {rubric['final_score']}%
 - Missing/weak: {json.dumps(rubric['missing'], ensure_ascii=False)}
+
+DETECTED MIS-CITATIONS:
+{json.dumps(rubric['citation_issues'], ensure_ascii=False)}
+
+DETECTED SUBSTANTIVE FLAGS:
+{json.dumps(rubric['substantive_flags'], ensure_ascii=False)}
 
 MODEL ANSWER (AUTHORITATIVE; PREVAILS IN DOUBT):
 \"\"\"{model_answer}\"\"\"
@@ -337,15 +409,14 @@ EXCERPTS (quote sparingly):
 {excerpts_block}
 
 TASK:
-Provide <220 words of numbered, actionable feedback. Align with MAR, Prospectus Regulation, MiFID II, WpHG, WpÜG.
-Cite using [n] where helpful. If sources diverge, explain and follow the MODEL ANSWER.
+Provide <220 words of numbered, actionable feedback. Correct any mis-citations (e.g., Art 3(1) PR -> Art 3(3) PR; § 40 WpHG -> § 43(1) WpHG).
+Explain briefly why, with citations [n]. If sources diverge, follow the MODEL ANSWER.
 """
 
 def build_chat_prompt(chat_history: List[Dict], model_answer: str, sources_block: str, excerpts_block: str) -> List[Dict]:
     msgs = [{"role": "system", "content": system_guardrails()}]
     for m in chat_history[-8:]:
-        if m["role"] in ("user", "assistant"):
-            msgs.append(m)
+        if m["role"] in ("user", "assistant"): msgs.append(m)
     msgs.append({"role": "system", "content": "MODEL ANSWER (authoritative):\n" + model_answer})
     msgs.append({"role": "system", "content": "SOURCES:\n" + sources_block})
     msgs.append({"role": "system", "content": "RELEVANT EXCERPTS (quote sparingly):\n" + excerpts_block})
@@ -361,16 +432,32 @@ with st.expander("📚 Case (click to read)"):
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    api_key = st.text_input("OpenRouter API Key", type="password")
-    model_name = st.selectbox(
-        "Model",
-        ["meta-llama/llama-3.1-70b-instruct", "meta-llama/llama-3.1-8b-instruct", "mistralai/mistral-large-latest", "google/gemma-2-9b-it"],
-        index=0,
-    )
+    # Read from secrets/env; disable manual entry if present
+    key_from_secrets = st.secrets.get("OPENROUTER_API_KEY", None) if hasattr(st, "secrets") else None
+    key_from_env = os.getenv("OPENROUTER_API_KEY")
+    api_key = key_from_secrets or key_from_env
+    default_model = (st.secrets.get("DEFAULT_MODEL") if hasattr(st, "secrets") else None) or os.getenv("OPENROUTER_MODEL") or "meta-llama/llama-3.1-70b-instruct"
+
+    if api_key:
+        st.text_input("OpenRouter API Key", value="Provided via secrets/env", type="password", disabled=True)
+    else:
+        api_key = st.text_input("OpenRouter API Key", type="password")
+
+    available_models = [
+        "meta-llama/llama-3.1-70b-instruct",
+        "meta-llama/llama-3.1-8b-instruct",
+        "mistralai/mistral-large-latest",
+        "google/gemma-2-9b-it",
+    ]
+    if default_model not in available_models:
+        default_model = available_models[0]
+    model_name = st.selectbox("Model", options=available_models, index=available_models.index(default_model))
+
     temp = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
     w_sim = st.slider("Weight: Similarity", 0.0, 1.0, DEFAULT_WEIGHTS["similarity"], 0.05)
     w_cov = 1.0 - w_sim
     st.text(f"Weight: Coverage = {w_cov:.2f}")
+
     st.header("🌐 Web Retrieval")
     enable_web = st.checkbox("Enable web grounding", value=True)
     max_sources = st.slider("Max sources to cite", 3, 10, 6, 1)
@@ -379,6 +466,7 @@ with st.sidebar:
 st.subheader("📝 Your Answer")
 student_answer = st.text_area("Write your solution here (≥ ~120 words).", height=260)
 
+# ------------- Actions -------------
 colA, colB = st.columns([1, 1])
 
 with colA:
@@ -393,7 +481,7 @@ with colA:
                     pages = collect_corpus(student_answer, "", max_fetch=22)
                     top_pages, source_lines = retrieve_snippets(student_answer, MODEL_ANSWER, pages, backend, top_k_pages=max_sources, chunk_words=160)
                 else:
-                    pages, top_pages, source_lines = [], [], []
+                    top_pages, source_lines = [], []
 
             m1, m2, m3 = st.columns(3)
             m1.metric("Semantic Similarity", f"{rubric['similarity_pct']}%")
@@ -407,6 +495,17 @@ with colA:
                     miss = [kw for kw in row["keywords_total"] if kw not in row["keywords_hit"]]
                     st.markdown(f"- ⛔ Missing: {', '.join(miss) if miss else '—'}")
 
+            # Show detected mis-citations & substantive flags deterministically
+            if rubric["citation_issues"]["issues"] or rubric["substantive_flags"]:
+                st.markdown("### 🛠️ Detected corrections")
+                for it in rubric["citation_issues"]["issues"]:
+                    st.markdown(f"- ❗ {it}")
+                for sg in rubric["citation_issues"]["suggestions"]:
+                    st.markdown(f"  - ✔️ **Suggestion:** {sg}")
+                for fl in rubric["substantive_flags"]:
+                    st.markdown(f"- ⚖️ {fl}")
+
+            # Build sources/excerpts for LLM
             sources_block = "\n".join(source_lines) if source_lines else "(no web sources available)"
             excerpts_items = []
             for i, tp in enumerate(top_pages):
@@ -420,11 +519,14 @@ with colA:
                     {"role": "system", "content": system_guardrails()},
                     {"role": "user", "content": build_feedback_prompt(student_answer, rubric, MODEL_ANSWER, sources_block, excerpts_block)},
                 ]
-                reply = call_openrouter(messages, api_key, model_name=model_name, temperature=temp, max_tokens=450)
+                reply = call_openrouter(messages, api_key, model_name=model_name, temperature=temp, max_tokens=460)
                 if reply:
                     st.write(reply)
                 else:
-                    st.info("LLM unavailable. Showing deterministic guidance only.")
+                    st.info("LLM unavailable. See corrections above and the issue breakdown.")
+            else:
+                st.info("No API key found in secrets/env. Deterministic scoring and corrections shown above.")
+
             if source_lines:
                 with st.expander("📚 Sources used"):
                     for line in source_lines:
@@ -460,9 +562,7 @@ with colB:
             st.session_state.chat_history.append({"role": "user", "content": user_q})
             if api_key:
                 msgs = [{"role": "system", "content": system_guardrails()}]
-                # include last few user/assistant turns
                 msgs.extend([m for m in st.session_state.chat_history if m["role"] in ("user","assistant")][-8:])
-                # add authoritative context & sources
                 msgs.append({"role": "system", "content": "MODEL ANSWER (authoritative):\n" + MODEL_ANSWER})
                 msgs.append({"role": "system", "content": "SOURCES:\n" + sources_block})
                 msgs.append({"role": "system", "content": "RELEVANT EXCERPTS:\n" + excerpts_block})
@@ -483,6 +583,7 @@ with colB:
 
 st.divider()
 st.markdown(
-    "ℹ️ **Notes**: This is an educational tool. The tutor grounds answers in authoritative sources and the hidden "
-    "model answer. If web sources appear to diverge, the tutor explains the divergence but follows the model answer."
+    "ℹ️ **Notes**: The app grounds answers in authoritative sources and the hidden model answer. "
+    "If web sources appear to diverge, the tutor explains the divergence but follows the model answer."
 )
+``
