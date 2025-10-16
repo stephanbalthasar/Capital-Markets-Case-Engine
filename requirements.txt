@@ -1,4 +1,7 @@
-streamlit
+streamlit>=1.36
+numpy
+scikit-learn
 sentence-transformers
-transformers
-torch
+requests
+beautifulsoup4
+lxml
