@@ -455,8 +455,7 @@ MODEL ANSWER (AUTHORITATIVE; PREVAILS IN DOUBT):
 \"\"\"{model_answer}\"\"\"
 
 SOURCES:
-{s
-ources_block}
+{sources_block}
 
 EXCERPTS (quote sparingly):
 {excerpts_block}
