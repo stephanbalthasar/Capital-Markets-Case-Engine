@@ -1,10 +1,8 @@
 # app.py
-# Neon Case Tutor — Web‑Grounded Feedback & Chatbot (OpenRouter + RAG)
-# - Robust citation matching (e.g., "§ 33(1) WpHG" matches "§ 33 WpHG")
-# - Mis-citation detector (Art 3(1) PR -> Art 3(3) PR; § 40 WpHG -> § 43(1) WpHG)
-# - Substantive flag for Art 17(4) MAR delay claims
-# - Reads OPENROUTER_API_KEY from Streamlit secrets/env
-# - Build fingerprint + diagnostics to surface LLM errors
+# Neon Case Tutor — Free LLM (Groq) + Web-Grounded Feedback & Chat
+# - Free LLM via Groq (llama-3.1-8b/70b-instant): no credits or payments
+# - Web retrieval from EUR-Lex, CURIA, ESMA, BaFin, Gesetze-im-Internet
+# - Hidden model answer is authoritative; citations [1], [2] map to sources
 
 import os
 import re
@@ -13,7 +11,6 @@ import hashlib
 import pathlib
 from typing import List, Dict, Tuple
 from urllib.parse import quote_plus, urlparse
-
 import numpy as np
 import streamlit as st
 from sklearn.metrics.pairwise import cosine_similarity
@@ -22,56 +19,15 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 import requests
 from bs4 import BeautifulSoup
 
-# ---------------- Build fingerprint (verify latest deployment) ----------------
+# ---------------- Build fingerprint (to verify latest deployment) ----------------
 APP_HASH = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:10]
-
-# ---------------- Optional: OpenRouter connectivity test ----------------
-def test_openrouter_connectivity(api_key: str):
-    st.subheader("🔌 OpenRouter connectivity test")
-    if not api_key:
-        st.error("No API key found (OPENROUTER_API_KEY). Add it to Streamlit Secrets.")
-        return
-
-    try:
-        r = requests.get(
-            "https://openrouter.ai/api/v1/models",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=20,
-        )
-        st.write("GET /models →", r.status_code)
-        st.code((r.text or "")[:1000], language="json")
-        if r.status_code != 200:
-            st.warning("Non-200 from /models. Check key/plan or try another model.")
-            return
-    except Exception as e:
-        st.exception(e)
-        return
-
-    # Minimal chat round-trip
-    payload = {
-        "model": "meta-llama/llama-3.1-70b-instruct",
-        "messages": [{"role": "user", "content": "Say: Hello from Neon Case Tutor"}],
-        "max_tokens": 32,
-        "temperature": 0.0,
-    }
-    try:
-        r2 = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=30,
-        )
-        st.write("POST /chat/completions →", r2.status_code)
-        st.code((r2.text or "")[:1000], language="json")
-    except Exception as e:
-        st.exception(e)
 
 # ---------------- Embeddings ----------------
 @st.cache_resource(show_spinner=False)
 def load_embedder():
+    """
+    Try a small sentence-transformer; if unavailable (e.g., install timeouts), fall back to TF-IDF.
+    """
     try:
         from sentence_transformers import SentenceTransformer
         model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
@@ -92,16 +48,14 @@ def embed_texts(texts: List[str], backend):
 def cos_sim(a, b):
     return float(cosine_similarity(a.reshape(1, -1), b.reshape(1, -1))[0, 0])
 
-def split_into_chunks(text: str, max_words: int = 200):
+def split_into_chunks(text: str, max_words: int = 180):
     words = text.split()
     chunks, cur = [], []
     for w in words:
         cur.append(w)
         if len(cur) >= max_words:
-            chunks.append(" ".join(cur))
-            cur = []
-    if cur:
-        chunks.append(" ".join(cur))
+            chunks.append(" ".join(cur)); cur = []
+    if cur: chunks.append(" ".join(cur))
     return chunks
 
 # ---------------- Case & Model Answer (YOUR CONTENT) ----------------
@@ -175,23 +129,19 @@ def normalize_ws(s: str) -> str:
 def canonicalize(s: str, strip_paren_numbers: bool = False) -> str:
     s = s.lower()
     s = s.replace("art.", "art").replace("article", "art").replace("–", "-")
-    s = s.replace("wpüg", "wpüg")  # normalize umlaut edge-case
+    s = s.replace("wpüg", "wpüg")
     s = re.sub(r"\s+", "", s)
     if strip_paren_numbers:
-        s = re.sub(r"\(\d+[a-z]?\)", "", s)  # remove (1), (2a) ...
+        s = re.sub(r"\(\d+[a-z]?\)", "", s)
     s = re.sub(r"[^a-z0-9§]", "", s)
     return s
 
 def keyword_present(answer: str, kw: str) -> bool:
-    # Legal citations via canonical forms: strip parentheses from the TEXT side
-    ans_can_strip = canonicalize(answer, strip_paren_numbers=True)
-    kw_can_strip = canonicalize(kw, strip_paren_numbers=True)
+    ans_can = canonicalize(answer, strip_paren_numbers=True)
+    kw_can = canonicalize(kw, strip_paren_numbers=True)
     if kw.strip().lower().startswith(("§", "art")):
-        return kw_can_strip in ans_can_strip
-    # General phrase fallback
-    hay = " " + normalize_ws(answer).lower() + " "
-    needle = normalize_ws(kw).lower()
-    return needle in hay
+        return kw_can in ans_can
+    return normalize_ws(kw).lower() in normalize_ws(answer).lower()
 
 def coverage_score(answer: str, issue: Dict) -> Tuple[int, List[str]]:
     hits = [kw for kw in issue["keywords"] if keyword_present(answer, kw)]
@@ -201,21 +151,21 @@ def coverage_score(answer: str, issue: Dict) -> Tuple[int, List[str]]:
 def detect_citation_issues(answer: str) -> Dict[str, List[str]]:
     issues, suggestions = [], []
     a = answer
-    # PR Art 3(1) vs 3(3) for admission to trading
+    # Art 3(1) PR (public offer) vs Art 3(3) PR (admission to trading)
     if re.search(r"\bart\.?\s*3\s*\(\s*1\s*\)\s*(pr|prospectus)", a, flags=re.IGNORECASE):
-        issues.append("You cited **Art 3(1) PR** for admission to trading (public‑offer rule).")
-        suggestions.append("For admission to a regulated market, cite **Art 3(3) PR**; also **Art 20/21 PR** on approval/publication.")
+        issues.append("You cited Art 3(1) PR for admission to trading (public-offer rule).")
+        suggestions.append("For admission to a regulated market, cite Art 3(3) PR; also Art 20/21 PR on approval/publication.")
     # § 40 WpHG vs § 43(1) WpHG (statement of intent)
     if re.search(r"§\s*40\s*wphg", a, flags=re.IGNORECASE):
-        issues.append("You cited **§ 40 WpHG**. The **statement of intent** is **§ 43(1) WpHG**.")
-        suggestions.append("Replace **§ 40 WpHG** with **§ 43(1) WpHG**.")
+        issues.append("You cited § 40 WpHG. The statement of intent is § 43(1) WpHG.")
+        suggestions.append("Replace § 40 WpHG with § 43(1) WpHG.")
     return {"issues": issues, "suggestions": suggestions}
 
 def detect_substantive_flags(answer: str) -> List[str]:
     flags = []
     low = answer.lower()
     if "always delay" in low or re.search(r"\b(can|may)\s+always\s+delay\b", low):
-        flags.append("Delay under **Art 17(4) MAR** is **conditional**: (a) legitimate interest, (b) not misleading, (c) confidentiality ensured.")
+        flags.append("Delay under Art 17(4) MAR is conditional: (a) legitimate interest, (b) not misleading, (c) confidentiality ensured.")
     return flags
 
 def summarize_rubric(student_answer: str, model_answer: str, backend, required_issues: List[Dict], weights: Dict):
@@ -257,12 +207,12 @@ def summarize_rubric(student_answer: str, model_answer: str, backend, required_i
 
 # ---------------- Web Retrieval (RAG) ----------------
 ALLOWED_DOMAINS = {
-    "eur-lex.europa.eu",
-    "curia.europa.eu",
-    "www.esma.europa.eu",
-    "www.bafin.de",
-    "www.gesetze-im-internet.de", "gesetze-im-internet.de",
-    "www.bundesgerichtshof.de",
+    "eur-lex.europa.eu",        # EU law (MAR, PR, MiFID II, TD)
+    "curia.europa.eu",          # CJEU (Lafonta C‑628/13 etc.)
+    "www.esma.europa.eu",       # ESMA guidelines/news
+    "www.bafin.de",             # BaFin
+    "www.gesetze-im-internet.de", "gesetze-im-internet.de",  # WpHG, WpÜG
+    "www.bundesgerichtshof.de", # BGH
 }
 
 SEED_URLS = [
@@ -360,14 +310,12 @@ def collect_corpus(student_answer: str, extra_user_q: str, max_fetch: int = 20) 
             fetched.append(pg)
     return fetched
 
-def retrieve_snippets(student_answer: str, model_answer: str, pages: List[Dict], backend, top_k_pages: int = 8, chunk_words: int = 160):
-    if not pages:
-        return [], []
+def retrieve_snippets(student_answer: str, model_answer: str, pages: List[Dict], backend, top_k_pages: int = 8, chunk_words: int = 170):
+    if not pages: return [], []
     chunks, meta = [], []
     for i, p in enumerate(pages):
         for ch in split_into_chunks(p["text"], max_words=chunk_words):
-            chunks.append(ch)
-            meta.append((i, p["url"], p["title"]))
+            chunks.append(ch); meta.append((i, p["url"], p["title"]))
     query = (student_answer or "") + "\n\n" + (model_answer or "")
     embs = embed_texts([query] + chunks, backend)
     qv, cvs = embs[0], embs[1:]
@@ -386,50 +334,37 @@ def retrieve_snippets(student_answer: str, model_answer: str, pages: List[Dict],
     source_lines = [f"[{i+1}] {tp['title']} — {tp['url']}" for i, tp in enumerate(top_pages)]
     return top_pages, source_lines
 
-# ---------------- LLM (OpenRouter) ----------------
-def call_openrouter(messages: List[Dict], api_key: str, model_name: str,
-                    temperature: float = 0.2, max_tokens: int = 700) -> str:
+# ---------------- LLM via Groq (free) ----------------
+def call_groq(messages: List[Dict], api_key: str, model_name: str = "llama-3.1-8b-instant",
+              temperature: float = 0.2, max_tokens: int = 700) -> str:
+    """
+    Groq OpenAI-compatible chat endpoint. Models like llama-3.1-8b-instant / 70b-instant are free.
+    """
     if not api_key:
-        st.error("No OpenRouter API key found (OPENROUTER_API_KEY).")
+        st.error("No GROQ_API_KEY found (add it to Streamlit Secrets).")
         return None
-
-    # Read optional attribution headers from secrets/env
-    referer = (st.secrets.get("OPENROUTER_HTTP_REFERER") if hasattr(st, "secrets") else None) or os.getenv("OPENROUTER_HTTP_REFERER")
-    xtitle  = (st.secrets.get("OPENROUTER_X_TITLE")       if hasattr(st, "secrets") else None) or os.getenv("OPENROUTER_X_TITLE")
-
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    if referer:
-        headers["HTTP-Referer"] = referer
-    if xtitle:
-        headers["X-Title"] = xtitle
-
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     data = {
         "model": model_name,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-
     try:
         r = requests.post(url, headers=headers, json=data, timeout=60)
         if r.status_code != 200:
-            # Surface error body so you see the exact cause (401/403/402/429/etc.)
-            try:
-                body = r.json()
-            except Exception:
-                body = r.text
-            st.error(f"OpenRouter error {r.status_code}: {body}")
+            # Show exact error so it's easy to fix
+            try: body = r.json()
+            except Exception: body = r.text
+            st.error(f"Groq error {r.status_code}: {body}")
             return None
         return r.json()["choices"][0]["message"]["content"]
     except requests.exceptions.Timeout:
-        st.error("OpenRouter request timed out (60s). Try again or reduce max_tokens.")
+        st.error("Groq request timed out (60s). Try again or reduce max_tokens.")
         return None
     except requests.exceptions.RequestException as e:
-        st.error(f"OpenRouter request failed: {e}")
+        st.error(f"Groq request failed: {e}")
         return None
 
 def system_guardrails():
@@ -441,16 +376,15 @@ def system_guardrails():
     )
 
 def build_feedback_prompt(student_answer: str, rubric: Dict, model_answer: str, sources_block: str, excerpts_block: str) -> str:
-    return f"""GRADE THE STUDENT'S ANSWER USING THE RUBRIC, MIS-CITATION FLAGS, AND WEB SOURCES.
+    return f"""GRADE THE STUDENT'S ANSWER USING THE RUBRIC, DETECTED ISSUES, AND WEB SOURCES.
 
 STUDENT ANSWER:
 \"\"\"{student_answer}\"\"\"
 
-RUBRIC:
+RUBRIC SCORES:
 - Similarity to model answer: {rubric['similarity_pct']}%
 - Issue coverage: {rubric['coverage_pct']}%
 - Overall score: {rubric['final_score']}%
-- Missing/weak: {json.dumps(rubric['missing'], ensure_ascii=False)}
 
 DETECTED MIS-CITATIONS:
 {json.dumps(rubric['citation_issues'], ensure_ascii=False)}
@@ -458,76 +392,74 @@ DETECTED MIS-CITATIONS:
 DETECTED SUBSTANTIVE FLAGS:
 {json.dumps(rubric['substantive_flags'], ensure_ascii=False)}
 
-MODEL ANSWER (AUTHORITATIVE; PREVAILS IN DOUBT):
+MODEL ANSWER (AUTHORITATIVE):
 \"\"\"{model_answer}\"\"\"
 
-SOURCES:
+SOURCES (numbered):
 {sources_block}
 
-EXCERPTS (quote sparingly):
+EXCERPTS (quote sparingly; use [n] to cite):
 {excerpts_block}
 
 TASK:
-Provide <220 words of numbered, actionable feedback. Correct any mis-citations (e.g., Art 3(1) PR -> Art 3(3) PR; § 40 WpHG -> § 43(1) WpHG).
+Provide <220 words of numbered, actionable feedback. Correct mis-citations (e.g., Art 3(1) PR -> Art 3(3) PR; § 40 WpHG -> § 43(1) WpHG).
 Explain briefly why, with citations [n]. If sources diverge, follow the MODEL ANSWER.
 """
 
-def build_chat_prompt(chat_history: List[Dict], model_answer: str, sources_block: str, excerpts_block: str) -> List[Dict]:
+def build_chat_messages(chat_history: List[Dict], model_answer: str, sources_block: str, excerpts_block: str) -> List[Dict]:
     msgs = [{"role": "system", "content": system_guardrails()}]
     for m in chat_history[-8:]:
-        if m["role"] in ("user", "assistant"):
-            msgs.append(m)
+        if m["role"] in ("user", "assistant"): msgs.append(m)
+    # Pin authoritative context and sources
     msgs.append({"role": "system", "content": "MODEL ANSWER (authoritative):\n" + model_answer})
     msgs.append({"role": "system", "content": "SOURCES:\n" + sources_block})
     msgs.append({"role": "system", "content": "RELEVANT EXCERPTS (quote sparingly):\n" + excerpts_block})
     return msgs
 
 # ---------------- UI ----------------
-st.set_page_config(page_title="Neon Case Tutor — Web-Grounded Feedback & Chat", page_icon="⚖️", layout="wide")
-st.title("⚖️ Neon Case Tutor — Web‑Grounded Feedback & Chatbot")
-st.caption(f"Model answer prevails in doubt. Web sources: EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet.  •  Build: {APP_HASH}")
+st.set_page_config(page_title="Neon Case Tutor — Free LLM (Groq)", page_icon="⚖️", layout="wide")
+st.title("⚖️ Neon Case Tutor — Free LLM (Groq) with Web‑Grounded Feedback & Chat")
+st.caption(f"Model answer prevails in doubt. Sources: EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet. • Build: {APP_HASH}")
 
 with st.expander("📚 Case (click to read)"):
     st.write(CASE)
 
 with st.sidebar:
     st.header("⚙️ Settings")
-
-    # Secrets/env
-    key_from_secrets = st.secrets.get("OPENROUTER_API_KEY", None) if hasattr(st, "secrets") else None
-    key_from_env = os.getenv("OPENROUTER_API_KEY")
-    api_key = key_from_secrets or key_from_env
-    default_model = (st.secrets.get("DEFAULT_MODEL") if hasattr(st, "secrets") else None) or os.getenv("OPENROUTER_MODEL") or "meta-llama/llama-3.1-70b-instruct"
-
+    api_key = (st.secrets.get("GROQ_API_KEY") if hasattr(st, "secrets") else None) or os.getenv("GROQ_API_KEY")
     if api_key:
-        st.text_input("OpenRouter API Key", value="Provided via secrets/env", type="password", disabled=True)
+        st.text_input("GROQ API Key", value="Provided via secrets/env", type="password", disabled=True)
     else:
-        api_key = st.text_input("OpenRouter API Key", type="password")
+        api_key = st.text_input("GROQ API Key", type="password", help="Set GROQ_API_KEY in Streamlit Secrets for production.")
 
-    available_models = [
-        "meta-llama/llama-3.1-70b-instruct",
-        "meta-llama/llama-3.1-8b-instruct",
-        "mistralai/mistral-large-latest",
-        "google/gemma-2-9b-it",
-    ]
-    if default_model not in available_models:
-        default_model = available_models[0]
-    model_name = st.selectbox("Model", options=available_models, index=available_models.index(default_model))
-
+    model_name = st.selectbox(
+        "Model (free)",
+        options=["llama-3.1-8b-instant", "llama-3.1-70b-instant"],
+        index=0,
+        help="Both are free; 8B is faster, 70B is smarter (and slower)."
+    )
     temp = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
-    w_sim = st.slider("Weight: Similarity", 0.0, 1.0, DEFAULT_WEIGHTS["similarity"], 0.05)
-    w_cov = 1.0 - w_sim
-    st.text(f"Weight: Coverage = {w_cov:.2f}")
 
     st.header("🌐 Web Retrieval")
     enable_web = st.checkbox("Enable web grounding", value=True)
     max_sources = st.slider("Max sources to cite", 3, 10, 6, 1)
-    st.caption("Searches DuckDuckGo HTML; filters to EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet, BGH.")
+    st.caption("DuckDuckGo HTML + filters to EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet, BGH.")
 
+    # Optional connectivity test
     st.divider()
     st.subheader("Diagnostics")
-    if st.checkbox("Run OpenRouter connectivity test"):
-        test_openrouter_connectivity(api_key)
+    if st.checkbox("Run Groq connectivity test"):
+        try:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key or ''}", "Content-Type": "application/json"},
+                json={"model": model_name, "messages": [{"role": "user", "content": "Say: hello from Groq test"}], "max_tokens": 8},
+                timeout=20,
+            )
+            st.write("POST /chat/completions →", r.status_code)
+            st.code((r.text or "")[:1000], language="json")
+        except Exception as e:
+            st.exception(e)
 
 st.subheader("📝 Your Answer")
 student_answer = st.text_area("Write your solution here (≥ ~120 words).", height=260)
@@ -542,26 +474,20 @@ with colA:
         else:
             with st.spinner("Scoring and collecting sources..."):
                 backend = load_embedder()
-                rubric = summarize_rubric(
-                    student_answer,
-                    MODEL_ANSWER,
-                    backend,
-                    REQUIRED_ISSUES,
-                    {"similarity": w_sim, "coverage": w_cov},
-                )
+                rubric = summarize_rubric(student_answer, MODEL_ANSWER, backend, REQUIRED_ISSUES, DEFAULT_WEIGHTS)
+
+                top_pages, source_lines = [], []
                 if enable_web:
                     pages = collect_corpus(student_answer, "", max_fetch=22)
-                    top_pages, source_lines = retrieve_snippets(
-                        student_answer, MODEL_ANSWER, pages, backend, top_k_pages=max_sources, chunk_words=160
-                    )
-                else:
-                    top_pages, source_lines = [], []
+                    top_pages, source_lines = retrieve_snippets(student_answer, MODEL_ANSWER, pages, backend, top_k_pages=max_sources, chunk_words=170)
 
+            # Metrics
             m1, m2, m3 = st.columns(3)
             m1.metric("Semantic Similarity", f"{rubric['similarity_pct']}%")
             m2.metric("Issue Coverage", f"{rubric['coverage_pct']}%")
             m3.metric("Overall Score", f"{rubric['final_score']}%")
 
+            # Breakdown
             with st.expander("🔬 Issue-by-issue breakdown"):
                 for row in rubric["per_issue"]:
                     st.markdown(f"**{row['issue']}** — {row['score']} / {row['max_points']}")
@@ -579,7 +505,7 @@ with colA:
                 for fl in rubric["substantive_flags"]:
                     st.markdown(f"- ⚖️ {fl}")
 
-            # Sources & excerpts for LLM
+            # LLM narrative feedback
             sources_block = "\n".join(source_lines) if source_lines else "(no web sources available)"
             excerpts_items = []
             for i, tp in enumerate(top_pages):
@@ -593,13 +519,13 @@ with colA:
                     {"role": "system", "content": system_guardrails()},
                     {"role": "user", "content": build_feedback_prompt(student_answer, rubric, MODEL_ANSWER, sources_block, excerpts_block)},
                 ]
-                reply = call_openrouter(messages, api_key, model_name=model_name, temperature=temp, max_tokens=460)
+                reply = call_groq(messages, api_key, model_name=model_name, temperature=temp, max_tokens=480)
                 if reply:
                     st.write(reply)
                 else:
                     st.info("LLM unavailable. See corrections above and the issue breakdown.")
             else:
-                st.info("No API key found in secrets/env. Deterministic scoring and corrections shown above.")
+                st.info("No GROQ_API_KEY found in secrets/env. Deterministic scoring and corrections shown above.")
 
             if source_lines:
                 with st.expander("📚 Sources used"):
@@ -621,15 +547,14 @@ with colB:
     if user_q:
         with st.spinner("Retrieving sources and drafting a grounded reply..."):
             backend = load_embedder()
+            top_pages, source_lines = [], []
             if enable_web:
-                # SAFE concatenation
-                query_for_snippets = "\n\n".join([student_answer or "", user_q or ""])
                 pages = collect_corpus(student_answer, user_q, max_fetch=20)
                 top_pages, source_lines = retrieve_snippets(
-                    query_for_snippets, MODEL_ANSWER, pages, backend, top_k_pages=max_sources, chunk_words=170
+                    (student_answer or "") + "\n\n" + user_q,
+                    MODEL_ANSWER, pages, backend, top_k_pages=max_sources, chunk_words=170
                 )
-            else:
-                top_pages, source_lines = [], []
+
             sources_block = "\n".join(source_lines) if source_lines else "(no web sources available)"
             excerpts_items = []
             for i, tp in enumerate(top_pages):
@@ -638,13 +563,10 @@ with colB:
             excerpts_block = "\n\n".join(excerpts_items[: max_sources * 3]) if excerpts_items else "(no excerpts)"
 
             st.session_state.chat_history.append({"role": "user", "content": user_q})
+
             if api_key:
-                msgs = [{"role": "system", "content": system_guardrails()}]
-                msgs.extend([m for m in st.session_state.chat_history if m["role"] in ("user", "assistant")][-8:])
-                msgs.append({"role": "system", "content": "MODEL ANSWER (authoritative):\n" + MODEL_ANSWER})
-                msgs.append({"role": "system", "content": "SOURCES:\n" + sources_block})
-                msgs.append({"role": "system", "content": "RELEVANT EXCERPTS:\n" + excerpts_block})
-                reply = call_openrouter(msgs, api_key, model_name=model_name, temperature=temp, max_tokens=600)
+                msgs = build_chat_messages(st.session_state.chat_history, MODEL_ANSWER, sources_block, excerpts_block)
+                reply = call_groq(msgs, api_key, model_name=model_name, temperature=temp, max_tokens=600)
             else:
                 reply = None
 
@@ -657,6 +579,7 @@ with colB:
 
             with st.chat_message("assistant"):
                 st.write(reply)
+
             st.session_state.chat_history.append({"role": "assistant", "content": reply})
 
 st.divider()
