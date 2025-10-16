@@ -1,14 +1,15 @@
 # app.py
 # Neon Case Tutor — Web‑Grounded Feedback & Chatbot (OpenRouter + RAG)
-# Improvements:
 # - Robust legal citation matching (e.g., "§ 33(1) WpHG" matches "§ 33 WpHG")
-# - Flags common mis-citations (Art 3(1) PR vs correct Art 3(3) PR; § 40 WpHG vs § 43(1) WpHG)
-# - Flags substantive misstatements (e.g., “always delay” under Art 17(4) MAR)
-# - Reads OPENROUTER_API_KEY from Streamlit secrets/env and disables key input if present
+# - Mis-citation detector (Art 3(1) PR -> Art 3(3) PR; § 40 WpHG -> § 43(1) WpHG)
+# - Substantive flag for Art 17(4) MAR delay claims
+# - Reads OPENROUTER_API_KEY from Streamlit secrets/env
+# - No stray Markdown backticks
 
 import os
 import re
 import json
+import hashlib, pathlib
 from typing import List, Dict, Tuple
 from urllib.parse import quote_plus, urlparse
 
@@ -19,6 +20,9 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 import requests
 from bs4 import BeautifulSoup
+
+# ---------------- Build fingerprint (to verify you run the latest) ----------------
+APP_HASH = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:10]
 
 # ---------------- Embeddings ----------------
 @st.cache_resource(show_spinner=False)
@@ -124,35 +128,23 @@ def normalize_ws(s: str) -> str:
 
 def canonicalize(s: str, strip_paren_numbers: bool = False) -> str:
     s = s.lower()
-    s = s.replace("art.", "art").replace("article", "art")
-    s = s.replace("–", "-")
-    # unify statute names
-    s = s.replace("wpüg", "wpüg")
-    # drop spaces for canonical contains-check
+    s = s.replace("art.", "art").replace("article", "art").replace("–", "-")
+    s = s.replace("wpüg", "wpüg")  # normalize umlaut
     s = re.sub(r"\s+", "", s)
-    # optionally remove bracketed numbers like (1), (2a)
     if strip_paren_numbers:
         s = re.sub(r"\(\d+[a-z]?\)", "", s)
-    # keep letters, digits, and § only
     s = re.sub(r"[^a-z0-9§]", "", s)
     return s
 
 def keyword_present(answer: str, kw: str) -> bool:
-    """
-    Flexible matcher:
-    - For legal citations ("§", "art"): compare canonical forms with parentheses removed in the TEXT,
-      so '§ 33(1) WpHG' matches keyword '§ 33 WpHG', and 'Art 3(3) PR' is distinct from 'Art 3(1) PR'.
-    - For general phrases: case-insensitive substring with whitespace normalization.
-    """
+    # Treat legal citations via canonical comparison (removing (1), (2a), etc. from text)
     ans_can_strip = canonicalize(answer, strip_paren_numbers=True)
     kw_can_strip = canonicalize(kw, strip_paren_numbers=True)
     if kw.strip().lower().startswith(("§", "art")):
         return kw_can_strip in ans_can_strip
-
     # General phrase fallback
     hay = " " + normalize_ws(answer).lower() + " "
     needle = normalize_ws(kw).lower()
-    # simple containment (allow inflection and punctuation variance handled above)
     return needle in hay
 
 def coverage_score(answer: str, issue: Dict) -> Tuple[int, List[str]]:
@@ -161,51 +153,41 @@ def coverage_score(answer: str, issue: Dict) -> Tuple[int, List[str]]:
     return score, hits
 
 def detect_citation_issues(answer: str) -> Dict[str, List[str]]:
-    """Detect common mis-citations and suggest corrections."""
-    issues = []
-    suggestions = []
+    issues, suggestions = [], []
     a = answer
-
-    # Art 3(1) PR vs Art 3(3) PR
+    # PR Art 3(1) vs 3(3)
     if re.search(r"\bart\.?\s*3\s*\(\s*1\s*\)\s*(pr|prospectus)", a, flags=re.IGNORECASE):
-        issues.append("You cited **Art 3(1) PR** for admission to trading. That article governs the public-offer requirement.")
-        suggestions.append("For admission to a regulated market, cite **Art 3(3) PR** (and typically **Art 20/21 PR** on approval/publication).")
-
-    # § 40 WpHG vs § 43(1) WpHG (statement of intent)
+        issues.append("You cited **Art 3(1) PR** for admission to trading (public‑offer rule).")
+        suggestions.append("For admission to a regulated market, cite **Art 3(3) PR**, plus **Art 20/21 PR** (approval/publication).")
+    # § 40 WpHG vs § 43(1) WpHG
     if re.search(r"§\s*40\s*wphg", a, flags=re.IGNORECASE):
         issues.append("You cited **§ 40 WpHG**. The **statement of intent** is **§ 43(1) WpHG**.")
-        suggestions.append("Replace **§ 40 WpHG** with **§ 43(1) WpHG** for the statement of intent.")
-
+        suggestions.append("Replace **§ 40 WpHG** with **§ 43(1) WpHG**.")
     return {"issues": issues, "suggestions": suggestions}
 
 def detect_substantive_flags(answer: str) -> List[str]:
     flags = []
     low = answer.lower()
     if "always delay" in low or re.search(r"\b(can|may)\s+always\s+delay\b", low):
-        flags.append("Delay under **Art 17(4) MAR** is **conditional**: (a) legitimate interest, (b) not misleading, (c) confidentiality ensured. It is not 'always' permitted.")
+        flags.append("Delay under **Art 17(4) MAR** is **conditional**: (a) legitimate interest, (b) not misleading, (c) confidentiality ensured.")
     return flags
 
 def summarize_rubric(student_answer: str, model_answer: str, backend, required_issues: List[Dict], weights: Dict):
-    # Semantic similarity
     embs = embed_texts([student_answer, model_answer], backend)
     sim = cos_sim(embs[0], embs[1])
     sim_pct = max(0.0, min(100.0, 100.0 * (sim + 1) / 2))
-
-    # Issue coverage
-    per_issue = []
-    total_points = 0
-    achieved_points = 0
+    per_issue, tot, got = [], 0, 0
     for issue in required_issues:
         pts = issue.get("points", 10)
-        total_points += pts
-        score, hits = coverage_score(student_answer, issue)
-        achieved_points += score
+        tot += pts
+        sc, hits = coverage_score(student_answer, issue)
+        got += sc
         per_issue.append({
-            "issue": issue["name"], "max_points": pts, "score": score,
+            "issue": issue["name"], "max_points": pts, "score": sc,
             "keywords_hit": hits, "keywords_total": issue["keywords"],
         })
-    coverage_pct = 100.0 * achieved_points / max(1, total_points)
-    final_score = (weights["similarity"] * sim_pct + weights["coverage"] * coverage_pct) / (weights["similarity"] + weights["coverage"])
+    cov_pct = 100.0 * got / max(1, tot)
+    final = (weights["similarity"] * sim_pct + weights["coverage"] * cov_pct) / (weights["similarity"] + weights["coverage"])
 
     missing = []
     for row in per_issue:
@@ -213,14 +195,13 @@ def summarize_rubric(student_answer: str, model_answer: str, backend, required_i
         if missed:
             missing.append({"issue": row["issue"], "missed_keywords": missed})
 
-    # Add targeted checks
     citation_issues = detect_citation_issues(student_answer)
     substantive_flags = detect_substantive_flags(student_answer)
 
     return {
         "similarity_pct": round(sim_pct, 1),
-        "coverage_pct": round(coverage_pct, 1),
-        "final_score": round(final_score, 1),
+        "coverage_pct": round(cov_pct, 1),
+        "final_score": round(final, 1),
         "per_issue": per_issue,
         "missing": missing,
         "citation_issues": citation_issues,
@@ -229,26 +210,22 @@ def summarize_rubric(student_answer: str, model_answer: str, backend, required_i
 
 # ---------------- Web Retrieval (RAG) ----------------
 ALLOWED_DOMAINS = {
-    "eur-lex.europa.eu",        # EU law (MAR, PR, TD, MiFID II)
-    "curia.europa.eu",          # CJEU (e.g., Lafonta C‑628/13; Geltl C‑19/11 if queried)
-    "www.esma.europa.eu",       # ESMA guidelines & Q&A
-    "www.bafin.de",             # BaFin guidance
-    "www.gesetze-im-internet.de", "gesetze-im-internet.de",  # German statutes (WpHG, WpÜG)
-    "www.bundesgerichtshof.de", # BGH
+    "eur-lex.europa.eu",
+    "curia.europa.eu",
+    "www.esma.europa.eu",
+    "www.bafin.de",
+    "www.gesetze-im-internet.de", "gesetze-im-internet.de",
+    "www.bundesgerichtshof.de",
 }
 
 SEED_URLS = [
-    # Core EU instruments (pinned)
     "https://eur-lex.europa.eu/eli/reg/2014/596/oj",   # MAR
     "https://eur-lex.europa.eu/eli/reg/2017/1129/oj",  # Prospectus Regulation
     "https://eur-lex.europa.eu/eli/dir/2014/65/oj",    # MiFID II
     "https://eur-lex.europa.eu/eli/dir/2004/109/oj",   # Transparency Directive
-    # CJEU Lafonta on specificity under Art 7(2) MAR
-    "https://curia.europa.eu/juris/liste.jsf?num=C-628/13",
-    # German statutes
+    "https://curia.europa.eu/juris/liste.jsf?num=C-628/13",  # Lafonta
     "https://www.gesetze-im-internet.de/wphg/",
     "https://www.gesetze-im-internet.de/wpu_g/",
-    # ESMA delay/disclosure guidelines under MAR
     "https://www.esma.europa.eu/press-news/esma-news/esma-finalises-guidelines-delayed-disclosure-inside-information-under-mar",
 ]
 
@@ -362,7 +339,7 @@ def call_openrouter(messages: List[Dict], api_key: str, model_name: str, tempera
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://your-streamlit-app.example",  # replace with your deployed URL (optional)
+        "HTTP-Referer": "https://your-streamlit-app.example",  # optional attribution
         "X-Title": "Neon Case Tutor",
     }
     data = {"model": model_name, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
@@ -425,14 +402,14 @@ def build_chat_prompt(chat_history: List[Dict], model_answer: str, sources_block
 # ---------------- UI ----------------
 st.set_page_config(page_title="Neon Case Tutor — Web-Grounded Feedback & Chat", page_icon="⚖️", layout="wide")
 st.title("⚖️ Neon Case Tutor — Web‑Grounded Feedback & Chatbot")
-st.caption("Model answer prevails in doubt. Feedback & chat cite EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet.")
+st.caption(f"Model answer prevails in doubt. Web sources: EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet.  •  Build: {APP_HASH}")
 
 with st.expander("📚 Case (click to read)"):
     st.write(CASE)
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    # Read from secrets/env; disable manual entry if present
+    # Secrets/env
     key_from_secrets = st.secrets.get("OPENROUTER_API_KEY", None) if hasattr(st, "secrets") else None
     key_from_env = os.getenv("OPENROUTER_API_KEY")
     api_key = key_from_secrets or key_from_env
@@ -472,118 +449,4 @@ colA, colB = st.columns([1, 1])
 with colA:
     if st.button("🔎 Generate Web‑Grounded Feedback"):
         if len(student_answer.strip()) < 80:
-            st.warning("Please write a bit more so I can evaluate meaningfully (≥ 80 words).")
-        else:
-            with st.spinner("Scoring and collecting sources..."):
-                backend = load_embedder()
-                rubric = summarize_rubric(student_answer, MODEL_ANSWER, backend, REQUIRED_ISSUES, {"similarity": w_sim, "coverage": w_cov})
-                if enable_web:
-                    pages = collect_corpus(student_answer, "", max_fetch=22)
-                    top_pages, source_lines = retrieve_snippets(student_answer, MODEL_ANSWER, pages, backend, top_k_pages=max_sources, chunk_words=160)
-                else:
-                    top_pages, source_lines = [], []
-
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Semantic Similarity", f"{rubric['similarity_pct']}%")
-            m2.metric("Issue Coverage", f"{rubric['coverage_pct']}%")
-            m3.metric("Overall Score", f"{rubric['final_score']}%")
-
-            with st.expander("🔬 Issue-by-issue breakdown"):
-                for row in rubric["per_issue"]:
-                    st.markdown(f"**{row['issue']}** — {row['score']} / {row['max_points']}")
-                    st.markdown(f"- ✅ Found: {', '.join(row['keywords_hit']) if row['keywords_hit'] else '—'}")
-                    miss = [kw for kw in row["keywords_total"] if kw not in row["keywords_hit"]]
-                    st.markdown(f"- ⛔ Missing: {', '.join(miss) if miss else '—'}")
-
-            # Show detected mis-citations & substantive flags deterministically
-            if rubric["citation_issues"]["issues"] or rubric["substantive_flags"]:
-                st.markdown("### 🛠️ Detected corrections")
-                for it in rubric["citation_issues"]["issues"]:
-                    st.markdown(f"- ❗ {it}")
-                for sg in rubric["citation_issues"]["suggestions"]:
-                    st.markdown(f"  - ✔️ **Suggestion:** {sg}")
-                for fl in rubric["substantive_flags"]:
-                    st.markdown(f"- ⚖️ {fl}")
-
-            # Build sources/excerpts for LLM
-            sources_block = "\n".join(source_lines) if source_lines else "(no web sources available)"
-            excerpts_items = []
-            for i, tp in enumerate(top_pages):
-                for sn in tp["snippets"]:
-                    excerpts_items.append(f"[{i+1}] {sn}")
-            excerpts_block = "\n\n".join(excerpts_items[: max_sources * 3]) if excerpts_items else "(no excerpts)"
-
-            st.markdown("### 🧭 Narrative Feedback (with citations)")
-            if api_key:
-                messages = [
-                    {"role": "system", "content": system_guardrails()},
-                    {"role": "user", "content": build_feedback_prompt(student_answer, rubric, MODEL_ANSWER, sources_block, excerpts_block)},
-                ]
-                reply = call_openrouter(messages, api_key, model_name=model_name, temperature=temp, max_tokens=460)
-                if reply:
-                    st.write(reply)
-                else:
-                    st.info("LLM unavailable. See corrections above and the issue breakdown.")
-            else:
-                st.info("No API key found in secrets/env. Deterministic scoring and corrections shown above.")
-
-            if source_lines:
-                with st.expander("📚 Sources used"):
-                    for line in source_lines:
-                        st.markdown(f"- {line}")
-
-with colB:
-    st.markdown("### 💬 Tutor Chat (web‑grounded)")
-    st.caption("Ask follow-up questions. Answers cite authoritative sources and follow the model answer.")
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-
-    for msg in st.session_state.chat_history:
-        if msg["role"] in ("user", "assistant"):
-            with st.chat_message(msg["role"]):
-                st.write(msg["content"])
-
-    user_q = st.chat_input("Ask a question about your feedback, the law, or how to improve…")
-    if user_q:
-        with st.spinner("Retrieving sources and drafting a grounded reply..."):
-            backend = load_embedder()
-            if enable_web:
-                pages = collect_corpus(student_answer, user_q, max_fetch=20)
-                top_pages, source_lines = retrieve_snippets(student_answer + "\n\n" + user_q, MODEL_ANSWER, pages, backend, top_k_pages=max_sources, chunk_words=170)
-            else:
-                top_pages, source_lines = [], []
-            sources_block = "\n".join(source_lines) if source_lines else "(no web sources available)"
-            excerpts_items = []
-            for i, tp in enumerate(top_pages):
-                for sn in tp["snippets"]:
-                    excerpts_items.append(f"[{i+1}] {sn}")
-            excerpts_block = "\n\n".join(excerpts_items[: max_sources * 3]) if excerpts_items else "(no excerpts)"
-
-            st.session_state.chat_history.append({"role": "user", "content": user_q})
-            if api_key:
-                msgs = [{"role": "system", "content": system_guardrails()}]
-                msgs.extend([m for m in st.session_state.chat_history if m["role"] in ("user","assistant")][-8:])
-                msgs.append({"role": "system", "content": "MODEL ANSWER (authoritative):\n" + MODEL_ANSWER})
-                msgs.append({"role": "system", "content": "SOURCES:\n" + sources_block})
-                msgs.append({"role": "system", "content": "RELEVANT EXCERPTS:\n" + excerpts_block})
-                reply = call_openrouter(msgs, api_key, model_name=model_name, temperature=temp, max_tokens=600)
-            else:
-                reply = None
-
-            if not reply:
-                reply = (
-                    "I couldn’t reach the LLM. Here are the most relevant source snippets:\n\n"
-                    + (excerpts_block if excerpts_block != "(no excerpts)" else "— no sources available —")
-                    + "\n\nIn doubt, follow the model answer."
-                )
-
-            with st.chat_message("assistant"):
-                st.write(reply)
-            st.session_state.chat_history.append({"role": "assistant", "content": reply})
-
-st.divider()
-st.markdown(
-    "ℹ️ **Notes**: The app grounds answers in authoritative sources and the hidden model answer. "
-    "If web sources appear to diverge, the tutor explains the divergence but follows the model answer."
-)
-``
+           
