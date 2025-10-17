@@ -457,7 +457,7 @@ def require_login():
         st.stop()
 
 # Not authenticated yet → show only the login UI and stop
-st.stop()
+
 
 # Enforce login early — nothing else should render before this
 require_login()
