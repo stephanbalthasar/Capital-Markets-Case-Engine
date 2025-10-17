@@ -452,7 +452,17 @@ if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
 if not st.session_state.authenticated:
-    st.title("🔐 EUCapML Case Tutor Login")
+    
+    logo_col, title_col = st.columns([1, 5])
+
+with logo_col:
+    st.image("assets/logo.png", width=60)
+
+with title_col:
+    st.title("EUCapML Case Tutor")
+    
+    
+    
     pin_input = st.text_input("Enter your student PIN", type="password")
 
     try:
