@@ -442,16 +442,16 @@ def require_login():
 
     pin_input = st.text_input("Enter your student PIN", type="password")
 
-try:
-    correct_pin = st.secrets["STUDENT_PIN"]
-    if pin_input and pin_input == correct_pin:
+    try:
+        correct_pin = st.secrets["STUDENT_PIN"]
+        if pin_input and pin_input == correct_pin:
         st.session_state.authenticated = True
         st.session_state.just_logged_in = True
-except KeyError:
-    st.error("STUDENT_PIN not found in secrets. Configure it in .streamlit/secrets.toml.")
-    st.stop()
-    st.success("PIN accepted. Loading…")
-    st.rerun()
+    except KeyError:
+        st.error("STUDENT_PIN not found in secrets. Configure it in .streamlit/secrets.toml.")
+        st.stop()
+        st.success("PIN accepted. Loading…")
+        st.rerun()
 
 # Not authenticated yet → show only the login UI and stop
 st.stop()
