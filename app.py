@@ -17,7 +17,7 @@ MODEL_ANSWERS = {
     "Case 1": os.path.join(ASSETS_DIR, "model_answer1.txt"),
     "Case 2": os.path.join(ASSETS_DIR, "model_answer2.txt")
 }
-COURSE_MANUAL_PATH = os.path.join(ASSETS_DIR, "EUCapML - Course Manual.pdf")
+COURSE_MANUAL_PATH = os.path.join(ASSETS_DIR, "EUCapML - Course Booklet.pdf")
 
 # Load course manual text from PDF
 def load_course_manual_text(pdf_path):
