@@ -448,11 +448,9 @@ def require_login():
         st.error("STUDENT_PIN not found in secrets. Configure it in .streamlit/secrets.toml.")
         st.stop()
 
-    if pin_input and pin_input == correct_pin:
-        st.session_state.authenticated = True
-        st.session_state.just_logged_in = True
-        st.success("PIN accepted. Loading…")
-        st.rerun()
+# Safety guard: ensure nothing renders before login, even if helper changes
+if not st.session_state.authenticated:
+    st.stop()
 
     # Not authenticated yet → show nothing else
     st.stop()
@@ -471,9 +469,9 @@ if st.session_state.authenticated:
 
     case_selection = st.selectbox("Choose a case", ["Case 1", "Case 2"])
     case_file_map = {
-        "Case 1": ("case1.txt", "model_answer1.txt"),
-        "Case 2": ("case2.txt", "model_answer2.txt")
-    }
+        "Case 1": ("assets/case1.txt", "assets/model_answer1.txt"),
+        "Case 2": ("assets/case2.txt", "assets/model_answer2.txt")
+        }
     case_filename, model_filename = case_file_map[case_selection]
     CASE = load_text_file(case_filename)
     MODEL_ANSWER = load_text_file(model_filename)
