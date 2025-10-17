@@ -59,31 +59,6 @@ def split_into_chunks(text: str, max_words: int = 180):
     if cur: chunks.append(" ".join(cur))
     return chunks
 
-# ---------------- Case & Model Answer (YOUR CONTENT) ----------------
-import streamlit as st
-
-# Function to load text from a file
-def load_text_file(filename):
-    try:
-        with open(filename, "r", encoding="utf-8") as f:
-            return f.read()
-    except FileNotFoundError:
-        return f"File '{filename}' not found."
-
-# Dropdown menu for case selection
-case_selection = st.selectbox("Choose a case", ["Case 1", "Case 2"])
-
-# Map selection to filenames
-case_file_map = {
-    "Case 1": ("case1.txt", "model_answer1.txt"),
-    "Case 2": ("case2.txt", "model_answer2.txt")
-}
-
-# Load selected case and model answer
-case_filename, model_filename = case_file_map[case_selection]
-CASE = load_text_file(case_filename)
-MODEL_ANSWER = load_text_file(model_filename)
-
 # ---------------- Scoring Rubric ----------------
 REQUIRED_ISSUES = [
     {
@@ -473,6 +448,27 @@ with title_col:
     elif pin_input:
         st.error("Incorrect PIN. Please try again.")
     st.stop()
+
+# Show case selection only after login
+if st.session_state.authenticated:
+    def load_text_file(filename):
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            return f"File '{filename}' not found."
+
+    case_selection = st.selectbox("Choose a case", ["Case 1", "Case 2"])
+    case_file_map = {
+        "Case 1": ("case1.txt", "model_answer1.txt"),
+        "Case 2": ("case2.txt", "model_answer2.txt")
+    }
+    case_filename, model_filename = case_file_map[case_selection]
+    CASE = load_text_file(case_filename)
+    MODEL_ANSWER = load_text_file(model_filename)
+
+    with st.expander("📘 Case (click to read)"):
+        st.write(CASE)
 
 # Sidebar (visible to all users after login)
 with st.sidebar:
