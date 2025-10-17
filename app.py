@@ -79,7 +79,7 @@ def main():
         if st.button("Login"):
             if pin_input == st.secrets["STUDENT_PIN"]:
                 st.session_state.authenticated = True
-                st.experimental_rerun()
+                st.experimental_set_query_params(dummy=str(pin_input))  # Triggers rerun
             else:
                 st.error("Invalid PIN. Please try again.")
         return
