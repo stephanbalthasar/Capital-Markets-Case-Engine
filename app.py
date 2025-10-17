@@ -313,26 +313,47 @@ def collect_corpus(student_answer: str, extra_user_q: str, max_fetch: int = 20) 
     return fetched
 
 def retrieve_snippets(student_answer: str, model_answer: str, pages: List[Dict], backend, top_k_pages: int = 8, chunk_words: int = 170):
-    if not pages: return [], []
-    chunks, meta = [], []
+    import fitz  # PyMuPDF
+
+def retrieve_snippets_with_manual(student_answer: str, model_answer: str, pages: List[Dict], backend, top_k_pages: int = 8, chunk_words: int = 170):
+    # Load course manual
+    try:
+        doc = fitz.open("assets/EUCapML - Course Booklet.pdf")
+        manual_text = " ".join([page.get_text() for page in doc])
+        doc.close()
+    except Exception as e:
+        manual_text = ""
+        st.warning(f"Could not load course manual: {e}")
+
+    manual_chunks = split_into_chunks(manual_text, max_words=chunk_words)
+    manual_meta = [(-1, "Course Manual", "EUCapML - Course Booklet.pdf")] * len(manual_chunks)
+
+    # Prepare web chunks
+    web_chunks, web_meta = [], []
     for i, p in enumerate(pages):
         for ch in split_into_chunks(p["text"], max_words=chunk_words):
-            chunks.append(ch); meta.append((i, p["url"], p["title"]))
+            web_chunks.append(ch)
+            web_meta.append((i, p["url"], p["title"]))
+
+    all_chunks = manual_chunks + web_chunks
+    all_meta = manual_meta + web_meta
     query = (student_answer or "") + "\n\n" + (model_answer or "")
-    embs = embed_texts([query] + chunks, backend)
+    embs = embed_texts([query] + all_chunks, backend)
     qv, cvs = embs[0], embs[1:]
     sims = [cos_sim(qv, v) for v in cvs]
     idx = np.argsort(sims)[::-1]
+
     per_page = {}
-    for j in idx[: min(400, len(idx))]:
-        pi, url, title = meta[j]
-        snip = chunks[j]
+    for j in idx[:400]:
+        pi, url, title = all_meta[j]
+        snip = all_chunks[j]
         arr = per_page.setdefault(pi, {"url": url, "title": title, "snippets": []})
         if len(arr["snippets"]) < 3:
             arr["snippets"].append(snip)
         if len(per_page) >= top_k_pages:
             break
-    top_pages = [per_page[k] for k in sorted(per_page.keys(), key=lambda x: x)][:top_k_pages]
+
+    top_pages = [per_page[k] for k in sorted(per_page.keys())][:top_k_pages]
     source_lines = [f"[{i+1}] {tp['title']} — {tp['url']}" for i, tp in enumerate(top_pages)]
     return top_pages, source_lines
 
