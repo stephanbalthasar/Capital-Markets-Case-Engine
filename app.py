@@ -437,7 +437,7 @@ if not st.session_state.authenticated:
     if pin_input:
         if pin_input == correct_pin:
             st.session_state.authenticated = True
-            st.experimental_rerun()
+            st.stop()
         else:
             st.error("Incorrect PIN. Please try again.")
             st.stop()
