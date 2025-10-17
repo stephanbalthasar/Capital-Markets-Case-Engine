@@ -511,7 +511,7 @@ with colA:
                 top_pages, source_lines = [], []
                 if enable_web:
                     pages = collect_corpus(student_answer, "", max_fetch=22)
-                    top_pages, source_lines = retrieve_snippets(student_answer, MODEL_ANSWER, pages, backend, top_k_pages=max_sources, chunk_words=170)
+                    top_pages, source_lines = retrieve_snippets_with_manual(student_answer, MODEL_ANSWER, pages, backend, top_k_pages=max_sources, chunk_words=170)
 
             # Metrics
             m1, m2, m3 = st.columns(3)
