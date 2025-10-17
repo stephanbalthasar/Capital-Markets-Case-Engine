@@ -9,6 +9,7 @@ import re
 import json
 import hashlib
 import pathlib
+import fitz  # PyMuPDF
 from typing import List, Dict, Tuple
 from urllib.parse import quote_plus, urlparse
 import numpy as np
