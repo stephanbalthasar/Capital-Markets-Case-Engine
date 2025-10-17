@@ -425,7 +425,11 @@ if not st.session_state.authenticated:
     logo_col, title_col = st.columns([1, 5])
 
 with logo_col:
-    st.image("assets/logo.png", width=240)
+    logo_path = "assets/logo.png"
+    if os.path.exists(logo_path):
+        st.image(logo_path, width=240)
+    else:
+        st.write("⚖️ EUCapML Case Tutor")
 
 with title_col:
     st.title("EUCapML Case Tutor")
