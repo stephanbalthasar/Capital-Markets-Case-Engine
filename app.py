@@ -473,8 +473,9 @@ if st.session_state.authenticated:
     CASE = load_text_file(case_filename)
     MODEL_ANSWER = load_text_file(model_filename)
 
-    with st.expander("📘 Case (click to read)"):
-        st.write(CASE)
+    if st.session_state.authenticated:
+        with st.expander("📘 Case (click to read)"):
+            st.write(CASE)
 
 # Sidebar (visible to all users after login)
 with st.sidebar:
