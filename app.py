@@ -37,15 +37,56 @@ def load_text(file_path):
             return f.read()
 
 # Generate feedback using Groq API (placeholder function)
+import requests
+
 def generate_feedback(student_answer, model_answer, course_manual_text, case_text):
-    # This is a placeholder. You would integrate Groq API here using st.secrets["GROQ_API_KEY"]
-    feedback = f"""
-    ✅ Covered Well: [Placeholder analysis]
-    ❌ Incorrect: [Placeholder analysis]
-    ❓ Missing: [Placeholder analysis]
-    📘 Suggestions: [Placeholder suggestions]
-    """
-    return feedback
+    api_key = st.secrets["GROQ_API_KEY"]
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    prompt = f"""
+You are a legal tutor for final year law students. A student has submitted an answer to a case. Your task is to evaluate the student's answer by comparing it with the model answer, the case text, and the course manual. Provide detailed feedback including:
+
+✅ What was covered well  
+❌ What was incorrect and why  
+❓ What was missing and why it matters  
+📘 Suggestions for improvement and references/resources  
+
+In case of doubt, the model answer shall prevail over other sources.
+
+CASE TEXT:
+{case_text}
+
+MODEL ANSWER:
+{model_answer}
+
+COURSE MANUAL:
+{course_manual_text}
+
+STUDENT ANSWER:
+{student_answer}
+
+Please provide your feedback below:
+"""
+
+    payload = {
+        "model": "llama3-70b-8192",
+        "messages": [
+            {"role": "system", "content": "You are a helpful and knowledgeable legal tutor."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.7
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+    if response.status_code == 200:
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
+    else:
+        return f"Error generating feedback: {response.status_code} - {response.text}"
 
 # Send email with answer and feedback
 def send_email(recipient_email, student_answer, feedback):
