@@ -447,13 +447,15 @@ def require_login():
     except KeyError:
         st.error("STUDENT_PIN not found in secrets. Configure it in .streamlit/secrets.toml.")
         st.stop()
+# Authenticate when the correct PIN is entered
+if pin_input and pin_input == correct_pin:
+    st.session_state.authenticated = True
+    st.session_state.just_logged_in = True
+    st.success("PIN accepted. Loading…")
+    st.rerun()
 
-# Safety guard: ensure nothing renders before login, even if helper changes
-if not st.session_state.authenticated:
-    st.stop()
-
-    # Not authenticated yet → show nothing else
-    st.stop()
+# Not authenticated yet → show only the login UI and stop
+st.stop()
 
 # Enforce login early — nothing else should render before this
 require_login()
