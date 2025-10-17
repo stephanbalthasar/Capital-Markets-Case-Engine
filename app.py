@@ -419,8 +419,18 @@ def build_chat_messages(chat_history: List[Dict], model_answer: str, sources_blo
     return msgs
 
 # ---------------- UI ----------------
+import streamlit as st
+import os
+import requests
+
 st.set_page_config(page_title="EUCapML Case Tutor", page_icon="⚖️", layout="wide")
-st.title("🔐 EUCapML Case Tutor Login")
+
+# Student login
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title("🔐 EUCapML Case Tutor Login")
     pin_input = st.text_input("Enter your student PIN", type="password")
 
     try:
@@ -429,18 +439,16 @@ st.title("🔐 EUCapML Case Tutor Login")
         st.error("STUDENT_PIN not found in secrets. Please configure it in .streamlit/secrets.toml.")
         st.stop()
 
-    if pin_input:
-        if pin_input == correct_pin:
-            st.session_state.authenticated = True
-            st.success("PIN accepted. Please click below to continue.")
-            if st.button("Continue"):
-                st.experimental_rerun()
-        else:
-            st.error("Incorrect PIN. Please try again.")
+    if pin_input == correct_pin:
+        st.session_state.authenticated = True
+        st.success("PIN accepted. Click below to continue.")
+        if st.button("Continue"):
+            st.experimental_rerun()
+    elif pin_input:
+        st.error("Incorrect PIN. Please try again.")
     st.stop()
 
-
-
+# Sidebar (visible to all users after login)
 with st.sidebar:
     st.header("⚙️ Settings")
     api_key = (st.secrets.get("GROQ_API_KEY") if hasattr(st, "secrets") else None) or os.getenv("GROQ_API_KEY")
@@ -477,51 +485,16 @@ with st.sidebar:
         except Exception as e:
             st.exception(e)
 
+# Main UI
 st.title("⚖️ EUCapML Case Tutor")
-st.caption(f"Model answer prevails in doubt. Sources: EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet. • Build: {APP_HASH}")
+st.caption("Model answer prevails in doubt. Sources: EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet.")
 
 with st.expander("📚 Case (click to read)"):
     st.write(CASE)
 
-with st.sidebar:
-    st.header("⚙️ Settings")
-    api_key = (st.secrets.get("GROQ_API_KEY") if hasattr(st, "secrets") else None) or os.getenv("GROQ_API_KEY")
-    if api_key:
-        st.text_input("GROQ API Key", value="Provided via secrets/env", type="password", disabled=True)
-    else:
-        api_key = st.text_input("GROQ API Key", type="password", help="Set GROQ_API_KEY in Streamlit Secrets for production.")
-
-    model_name = st.selectbox(
-        "Model (free)",
-        options=["llama-3.1-8b-instant", "llama-3.1-70b-instant"],
-        index=0,
-        help="Both are free; 8B is faster, 70B is smarter (and slower)."
-    )
-    temp = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
-
-    st.header("🌐 Web Retrieval")
-    enable_web = st.checkbox("Enable web grounding", value=True)
-    max_sources = st.slider("Max sources to cite", 3, 10, 6, 1)
-    st.caption("DuckDuckGo HTML + filters to EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet, BGH.")
-
-    # Optional connectivity test
-    st.divider()
-    st.subheader("Diagnostics")
-    if st.checkbox("Run Groq connectivity test"):
-        try:
-            r = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key or ''}", "Content-Type": "application/json"},
-                json={"model": model_name, "messages": [{"role": "user", "content": "Say: hello from Groq test"}], "max_tokens": 8},
-                timeout=20,
-            )
-            st.write("POST /chat/completions →", r.status_code)
-            st.code((r.text or "")[:1000], language="json")
-        except Exception as e:
-            st.exception(e)
-
 st.subheader("📝 Your Answer")
 student_answer = st.text_area("Write your solution here (≥ ~120 words).", height=260)
+
 
 # ------------- Actions -------------
 colA, colB = st.columns([1, 1])
