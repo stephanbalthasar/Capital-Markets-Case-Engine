@@ -71,7 +71,7 @@ Please provide your feedback below:
 """
 
     payload = {
-        "model": "llama3-8b-8192",
+        "model": "llama-3.1-8b-instant",
         "messages": [
             {"role": "system", "content": "You are a helpful and knowledgeable legal tutor."},
             {"role": "user", "content": prompt}
@@ -152,8 +152,19 @@ def main():
         feedback = generate_feedback(student_answer, model_answer, course_manual_text, case_text)
         st.session_state.feedback = feedback
         st.subheader("Feedback")
-        st.text_area("Feedback", feedback, height=300, disabled=True)
+        import html
 
+        escaped_case_text = html.escape(case_text)
+        st.markdown(
+            f"""
+            <div style="background-color: white; color: black; padding: 1em; border-radius: 5px; border: 1px solid #ccc;">
+            <pre style="white-space: pre-wrap; word-wrap: break-word;">{escaped_case_text}
+        </pre>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        
     if "feedback" in st.session_state:
         email_input = st.text_input("Enter your email to receive feedback")
         if st.button("Send Email"):
