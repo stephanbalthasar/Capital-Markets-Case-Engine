@@ -521,7 +521,7 @@ student_answer = st.text_area("Write your solution here (≥ ~120 words).", heig
 colA, colB = st.columns([1, 1])
 
 with colA:
-    if st.button("🔎 Generate Web‑Grounded Feedback"):
+    if st.button("🔎 Generate Feedback"):
         if len(student_answer.strip()) < 80:
             st.warning("Please write a bit more so I can evaluate meaningfully (≥ 80 words).")
         else:
