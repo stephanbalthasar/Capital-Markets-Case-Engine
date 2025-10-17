@@ -451,7 +451,10 @@ def require_login():
             st.success("PIN accepted. Loading…")
             st.rerun()
         else:
-            st.stop()
+            st.stop() # Only stop if PIN is incorrect
+    except KeyError:
+        st.error("STUDENT_PIN not found in secrets. Configure it in .streamlit/secrets.toml.")
+        st.stop()
 
 # Not authenticated yet → show only the login UI and stop
 st.stop()
