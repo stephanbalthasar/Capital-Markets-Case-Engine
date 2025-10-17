@@ -424,18 +424,23 @@ if not st.session_state.authenticated:
     
     logo_col, title_col = st.columns([1, 5])
 
+import os
+
+logo_col, title_col = st.columns([1, 5])
 with logo_col:
     logo_path = "assets/logo.png"
-    if os.path.exists(logo_path):
-        st.image(logo_path, width=240)
-    else:
-        st.write("⚖️ EUCapML Case Tutor")
+    try:
+        if os.path.exists(logo_path):
+            st.image(logo_path, width=240)
+        else:
+            st.markdown("### ⚖️ EUCapML Case Tutor")
+    except Exception as e:
+        st.markdown("### ⚖️ EUCapML Case Tutor")
+        st.warning(f"Logo image could not be loaded: {e}")
 
 with title_col:
-    st.title("EUCapML Case Tutor")
-    
-    
-    
+    st.title("EUCapML Case Tutor")    
+        
     pin_input = st.text_input("Enter your student PIN", type="password")
 
     try:
