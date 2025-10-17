@@ -518,8 +518,9 @@ with st.sidebar:
 st.title("⚖️ EUCapML Case Tutor")
 st.caption("Model answer prevails in doubt. Sources: EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet.")
 
-with st.expander("📚 Case (click to read)"):
-    st.write(CASE)
+if st.session_state.authenticated:
+    with st.expander("📘 Case (click to read)"):
+        st.write(CASE)
 
 st.subheader("📝 Your Answer")
 student_answer = st.text_area("Write your solution here (≥ ~120 words).", height=260)
