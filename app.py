@@ -416,7 +416,6 @@ import requests
 
 st.set_page_config(page_title="EUCapML Case Tutor", page_icon="⚖️", layout="wide")
 
-if st.session_state.authenticated:
     def load_text_file(filename):
         try:
             with open(filename, "r", encoding="utf-8") as f:
@@ -433,7 +432,6 @@ if st.session_state.authenticated:
     CASE = load_text_file(case_filename)
     MODEL_ANSWER = load_text_file(model_filename)
 
-    if st.session_state.authenticated:
         with st.expander("📘 Case (click to read)"):
             st.write(CASE)
 
@@ -478,7 +476,6 @@ with st.sidebar:
 st.title("⚖️ EUCapML Case Tutor")
 st.caption("Model answer prevails in doubt. Sources: EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet.")
 
-if st.session_state.authenticated:
     with st.expander("📘 Case (click to read)"):
         st.write(CASE)
 
