@@ -420,11 +420,6 @@ def build_chat_messages(chat_history: List[Dict], model_answer: str, sources_blo
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="EUCapML Case Tutor", page_icon="⚖️", layout="wide")
-# 🔐 Password protection
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if not st.session_state.authenticated:
     st.title("🔐 EUCapML Case Tutor Login")
     pin_input = st.text_input("Enter your student PIN", type="password")
 
@@ -444,67 +439,43 @@ if not st.session_state.authenticated:
             st.error("Incorrect PIN. Please try again.")
     st.stop()
 
-# 🔐 Instructor-only sidebar access
-if "instructor_authenticated" not in st.session_state:
-    st.session_state.instructor_authenticated = False
 
-if not st.session_state.instructor_authenticated:
-    with st.expander("🔐 Instructor Login"):
-        instructor_pin = st.text_input("Enter instructor PIN", type="password")
+
+with st.sidebar:
+    st.header("⚙️ Settings")
+    api_key = (st.secrets.get("GROQ_API_KEY") if hasattr(st, "secrets") else None) or os.getenv("GROQ_API_KEY")
+    if api_key:
+        st.text_input("GROQ API Key", value="Provided via secrets/env", type="password", disabled=True)
+    else:
+        api_key = st.text_input("GROQ API Key", type="password", help="Set GROQ_API_KEY in Streamlit Secrets for production.")
+
+    model_name = st.selectbox(
+        "Model (free)",
+        options=["llama-3.1-8b-instant", "llama-3.1-70b-instant"],
+        index=0,
+        help="Both are free; 8B is faster, 70B is smarter (and slower)."
+    )
+    temp = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
+
+    st.header("🌐 Web Retrieval")
+    enable_web = st.checkbox("Enable web grounding", value=True)
+    max_sources = st.slider("Max sources to cite", 3, 10, 6, 1)
+    st.caption("DuckDuckGo HTML + filters to EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet, BGH.")
+
+    st.divider()
+    st.subheader("Diagnostics")
+    if st.checkbox("Run Groq connectivity test"):
         try:
-            correct_instructor_pin = st.secrets["INSTRUCTOR_PIN"]
-        except KeyError:
-            st.error("INSTRUCTOR_PIN not found in secrets. Please configure it in .streamlit/secrets.toml.")
-            st.stop()
-
-        if instructor_pin == correct_instructor_pin:
-            st.session_state.instructor_authenticated = True
-            st.success("Instructor access granted. Click below to continue.")
-            if st.button("Continue as Instructor"):
-                st.experimental_rerun()
-        elif instructor_pin:
-            st.error("Incorrect instructor PIN.")
-
-# 🧭 Sidebar: only visible to instructors
-if st.session_state.instructor_authenticated:
-    with st.sidebar:
-        st.header("⚙️ Instructor Settings")
-        api_key = (st.secrets.get("GROQ_API_KEY") if hasattr(st, "secrets") else None) or os.getenv("GROQ_API_KEY")
-        if api_key:
-            st.text_input("GROQ API Key", value="Provided via secrets/env", type="password", disabled=True, key="groq_api_key_display")
-        else:
-            api_key = st.text_input("GROQ API Key", type="password", help="Set GROQ_API_KEY in Streamlit Secrets for production.", key="groq_api_key_input")
-
-        model_name = st.selectbox(
-            "Model (free)",
-            options=["llama-3.1-8b-instant", "llama-3.1-70b-instant"],
-            index=0,
-            help="Both are free; 8B is faster, 70B is smarter (and slower)."
-        )
-        temp = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
-
-        st.header("🌐 Web Retrieval")
-        enable_web = st.checkbox("Enable web grounding", value=True)
-        max_sources = st.slider("Max sources to cite", 3, 10, 6, 1)
-        st.caption("DuckDuckGo HTML + filters to EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet, BGH.")
-
-        st.divider()
-        st.subheader("Diagnostics")
-        if st.checkbox("Run Groq connectivity test"):
-            try:
-                r = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key or ''}", "Content-Type": "application/json"},
-                    json={"model": model_name, "messages": [{"role": "user", "content": "Say: hello from Groq test"}], "max_tokens": 8},
-                    timeout=20,
-                )
-                st.write("POST /chat/completions →", r.status_code)
-                st.code((r.text or "")[:1000], language="json")
-            except Exception as e:
-                st.exception(e)
-
-
-
+            r = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key or ''}", "Content-Type": "application/json"},
+                json={"model": model_name, "messages": [{"role": "user", "content": "Say: hello from Groq test"}], "max_tokens": 8},
+                timeout=20,
+            )
+            st.write("POST /chat/completions →", r.status_code)
+            st.code((r.text or "")[:1000], language="json")
+        except Exception as e:
+            st.exception(e)
 
 st.title("⚖️ EUCapML Case Tutor")
 st.caption(f"Model answer prevails in doubt. Sources: EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet. • Build: {APP_HASH}")
