@@ -450,10 +450,10 @@ with title_col:
         st.stop()
 
     if pin_input == correct_pin:
-    st.session_state.authenticated = True
-    st.session_state.just_logged_in = True
-    st.success("PIN accepted. Click below to continue.")
-    st.stop()  # Ends execution and triggers rerun automatically
+        st.session_state.authenticated = True
+        st.session_state.just_logged_in = True
+        st.success("PIN accepted. Click below to continue.")
+        st.stop()  # Ends execution and triggers rerun automatically
 
 # Show case selection only after login
 if st.session_state.authenticated:
