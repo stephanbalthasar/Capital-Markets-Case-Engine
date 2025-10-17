@@ -425,7 +425,6 @@ if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
 if not st.session_state.authenticated:
-    st.set_page_config(page_title="EUCapML Case Tutor", page_icon="⚖️", layout="wide")
     st.title("🔐 EUCapML Case Tutor Login")
     pin_input = st.text_input("Enter your student PIN", type="password")
 
@@ -438,12 +437,13 @@ if not st.session_state.authenticated:
     if pin_input:
         if pin_input == correct_pin:
             st.session_state.authenticated = True
-            st.experimental_rerun()  # ✅ triggers rerun with authenticated state
+            st.success("PIN accepted. Please click below to continue.")
+            if st.button("Continue"):
+                st.experimental_rerun()
         else:
             st.error("Incorrect PIN. Please try again.")
-            st.stop()
-    else:
-        st.stop()
+    st.stop()
+
 st.title("⚖️ EUCapML Case Tutor")
 st.caption(f"Model answer prevails in doubt. Sources: EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet. • Build: {APP_HASH}")
 
