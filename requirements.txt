@@ -1,8 +1,9 @@
+streamlit
+PyMuPDF
+requests
 streamlit>=1.36
 numpy
 scikit-learn
 sentence-transformers
-requests
 beautifulsoup4
 lxml
-pymupdf
