@@ -429,10 +429,10 @@ if not st.session_state.authenticated:
     pin_input = st.text_input("Enter your student PIN", type="password")
     correct_pin = st.secrets.get("STUDENTS_PIN", "")
 
-    if pin_input == correct_pin:
-        st.session_state.authenticated = True
-        st.experimental_rerun()
-    elif pin_input:
+if pin_input == correct_pin:
+    st.session_state.authenticated = True
+    st.stop()  # Stop rendering now; next run will show full app
+elif pin_input:
         st.error("Incorrect PIN. Please try again.")
     st.stop()
 st.title("⚖️ EUCapML Case Tutor")
