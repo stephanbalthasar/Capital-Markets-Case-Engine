@@ -425,25 +425,25 @@ if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
 if not st.session_state.authenticated:
+    st.set_page_config(page_title="EUCapML Case Tutor", page_icon="⚖️", layout="wide")
     st.title("🔐 EUCapML Case Tutor Login")
     pin_input = st.text_input("Enter your student PIN", type="password")
 
     try:
-        correct_pin = st.secrets["STUDENT_PIN"]
+        correct_pin = st.secrets["STUDENTS_PIN"]
     except KeyError:
-        st.error("STUDENT_PIN not found in secrets. Please configure it in .streamlit/secrets.toml.")
+        st.error("STUDENTS_PIN not found in secrets. Please configure it in .streamlit/secrets.toml.")
         st.stop()
 
     if pin_input:
         if pin_input == correct_pin:
             st.session_state.authenticated = True
-            st.stop()
+            st.experimental_rerun()  # ✅ triggers rerun with authenticated state
         else:
             st.error("Incorrect PIN. Please try again.")
             st.stop()
     else:
         st.stop()
-
 st.title("⚖️ EUCapML Case Tutor")
 st.caption(f"Model answer prevails in doubt. Sources: EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet. • Build: {APP_HASH}")
 
