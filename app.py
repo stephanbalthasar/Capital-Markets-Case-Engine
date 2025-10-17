@@ -1,8 +1,8 @@
 import streamlit as st
 import os
-import base64
 import fitz  # PyMuPDF
 import smtplib
+import requests
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -36,9 +36,7 @@ def load_text(file_path):
         with open(file_path, "r", encoding="latin-1") as f:
             return f.read()
 
-# Generate feedback using Groq API (placeholder function)
-import requests
-
+# Generate feedback using Groq API with LLaMA 3.1 8B
 def generate_feedback(student_answer, model_answer, course_manual_text, case_text):
     api_key = st.secrets["GROQ_API_KEY"]
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -73,7 +71,7 @@ Please provide your feedback below:
 """
 
     payload = {
-        "model": "llama3-70b-8192",
+        "model": "llama3-8b-8192",
         "messages": [
             {"role": "system", "content": "You are a helpful and knowledgeable legal tutor."},
             {"role": "user", "content": prompt}
@@ -120,15 +118,15 @@ def main():
 
     if not st.session_state.authenticated:
         st.title("EUCapML Case Tutor Login")
-        pin_input = st.text_input("Enter your STUDENT_PIN", type="password")    
+        pin_input = st.text_input("Enter your STUDENT_PIN", type="password")
         if st.button("Login"):
             if pin_input == st.secrets["STUDENT_PIN"]:
                 st.session_state.authenticated = True
-                st.query_params["auth"] = "1"  # Triggers rerun
+                st.query_params["auth"] = "1"
             else:
                 st.error("Invalid PIN. Please try again.")
         return
-    
+
     # Main App Interface
     st.image(LOGO_PATH, width=150)
     st.title("EUCapML Case Tutor")
@@ -136,7 +134,16 @@ def main():
     case_choice = st.selectbox("Select a case", list(CASE_FILES.keys()))
     case_text = load_text(CASE_FILES[case_choice])
     st.subheader(f"{case_choice} Details")
-    st.text_area("Case Content", case_text, height=300, disabled=True)
+
+    # Styled case display
+    st.markdown(
+        f"""
+        <div style="background-color: white; color: black; padding: 1em; border-radius: 5px; border: 1px solid #ccc;">
+            <pre style="white-space: pre-wrap; word-wrap: break-word;">{case_text}</pre>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
     student_answer = st.text_area("Enter your answer here", height=200)
     if st.button("Generate Feedback"):
