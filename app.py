@@ -75,15 +75,15 @@ def main():
 
     if not st.session_state.authenticated:
         st.title("EUCapML Case Tutor Login")
-        pin_input = st.text_input("Enter your STUDENT_PIN", type="password")
+        pin_input = st.text_input("Enter your STUDENT_PIN", type="password")    
         if st.button("Login"):
             if pin_input == st.secrets["STUDENT_PIN"]:
                 st.session_state.authenticated = True
-                st.experimental_set_query_params(dummy=str(pin_input))  # Triggers rerun
+                st.query_params["auth"] = "1"  # Triggers rerun
             else:
                 st.error("Invalid PIN. Please try again.")
         return
-
+    
     # Main App Interface
     st.image(LOGO_PATH, width=150)
     st.title("EUCapML Case Tutor")
