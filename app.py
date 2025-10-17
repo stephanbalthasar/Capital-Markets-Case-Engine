@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import html
 import fitz  # PyMuPDF
 import smtplib
 import requests
@@ -36,7 +37,7 @@ def load_text(file_path):
         with open(file_path, "r", encoding="latin-1") as f:
             return f.read()
 
-# Generate feedback using Groq API with LLaMA 3.1 8B
+# Generate feedback using Groq API with LLaMA 3.1 8B Instant
 def generate_feedback(student_answer, model_answer, course_manual_text, case_text):
     api_key = st.secrets["GROQ_API_KEY"]
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -128,18 +129,19 @@ def main():
         return
 
     # Main App Interface
-    st.image(LOGO_PATH, width=240)
+    st.image(LOGO_PATH, width=150)
     st.title("EUCapML Case Tutor")
 
     case_choice = st.selectbox("Select a case", list(CASE_FILES.keys()))
     case_text = load_text(CASE_FILES[case_choice])
     st.subheader(f"{case_choice} Details")
 
-    # Styled case display
+    # Styled case display with escaped HTML
+    escaped_case_text = html.escape(case_text)
     st.markdown(
         f"""
         <div style="background-color: white; color: black; padding: 1em; border-radius: 5px; border: 1px solid #ccc;">
-            <pre style="white-space: pre-wrap; word-wrap: break-word;">{case_text}</pre>
+            <pre style="white-space: pre-wrap; word-wrap: break-word;">{escaped_case_text}</pre>
         </div>
         """,
         unsafe_allow_html=True
@@ -152,19 +154,8 @@ def main():
         feedback = generate_feedback(student_answer, model_answer, course_manual_text, case_text)
         st.session_state.feedback = feedback
         st.subheader("Feedback")
-        import html
+        st.text_area("Feedback", feedback, height=300, disabled=True)
 
-        escaped_case_text = html.escape(case_text)
-        st.markdown(
-            f"""
-            <div style="background-color: white; color: black; padding: 1em; border-radius: 5px; border: 1px solid #ccc;">
-            <pre style="white-space: pre-wrap; word-wrap: break-word;">{escaped_case_text}
-        </pre>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-        
     if "feedback" in st.session_state:
         email_input = st.text_input("Enter your email to receive feedback")
         if st.button("Send Email"):
