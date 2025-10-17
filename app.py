@@ -429,9 +429,9 @@ if not st.session_state.authenticated:
     pin_input = st.text_input("Enter your student PIN", type="password")
 
     try:
-        correct_pin = st.secrets["STUDENTS_PIN"]
+        correct_pin = st.secrets["STUDENT_PIN"]
     except KeyError:
-        st.error("STUDENTS_PIN not found in secrets. Please configure it in .streamlit/secrets.toml.")
+        st.error("STUDENT_PIN not found in secrets. Please configure it in .streamlit/secrets.toml.")
         st.stop()
 
     if pin_input:
