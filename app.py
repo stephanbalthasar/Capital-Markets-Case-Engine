@@ -433,8 +433,8 @@ if pin_input == correct_pin:
     st.session_state.authenticated = True
     st.stop()  # Stop rendering now; next run will show full app
 elif pin_input:
-        st.error("Incorrect PIN. Please try again.")
-    st.stop()
+    st.error("Incorrect PIN. Please try again.")
+st.stop()
 st.title("⚖️ EUCapML Case Tutor")
 st.caption(f"Model answer prevails in doubt. Sources: EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet. • Build: {APP_HASH}")
 
