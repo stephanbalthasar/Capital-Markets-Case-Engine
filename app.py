@@ -444,53 +444,26 @@ if not st.session_state.authenticated:
             st.error("Incorrect PIN. Please try again.")
     st.stop()
 
-
-
-
 # 🔐 Instructor-only sidebar access
 if "instructor_authenticated" not in st.session_state:
     st.session_state.instructor_authenticated = False
 
 if not st.session_state.instructor_authenticated:
     with st.expander("🔐 Instructor Login"):
-        instructor_pin = st.text_input("Enter instructor PIN", type="password", key="instructor_pin")
+        instructor_pin = st.text_input("Enter instructor PIN", type="password")
         try:
             correct_instructor_pin = st.secrets["INSTRUCTOR_PIN"]
         except KeyError:
             st.error("INSTRUCTOR_PIN not found in secrets. Please configure it in .streamlit/secrets.toml.")
             st.stop()
 
-        if instructor_pin:
-            if instructor_pin == correct_instructor_pin:
-                st.session_state.instructor_authenticated = True
-                st.success("Instructor access granted. Click below to continue.")
-                if st.button("Continue as Instructor"):
-                    st.experimental_rerun()
-            else:
-                st.error("Incorrect instructor PIN.")
-
-
-# 🔐 Instructor-only sidebar access
-if "instructor_authenticated" not in st.session_state:
-    st.session_state.instructor_authenticated = False
-
-if not st.session_state.instructor_authenticated:
-    with st.expander("🔐 Instructor Login"):
-        instructor_pin = st.text_input("Enter instructor PIN", type="password", key="instructor_pin")
-        try:
-            correct_instructor_pin = st.secrets["INSTRUCTOR_PIN"]
-        except KeyError:
-            st.error("INSTRUCTOR_PIN not found in secrets. Please configure it in .streamlit/secrets.toml.")
-            st.stop()
-
-        if instructor_pin:
-            if instructor_pin == correct_instructor_pin:
-                st.session_state.instructor_authenticated = True
-                st.success("Instructor access granted. Click below to continue.")
-                if st.button("Continue as Instructor"):
-                    st.experimental_rerun()
-            else:
-                st.error("Incorrect instructor PIN.")
+        if instructor_pin == correct_instructor_pin:
+            st.session_state.instructor_authenticated = True
+            st.success("Instructor access granted. Click below to continue.")
+            if st.button("Continue as Instructor"):
+                st.experimental_rerun()
+        elif instructor_pin:
+            st.error("Incorrect instructor PIN.")
 
 # 🧭 Sidebar: only visible to instructors
 if st.session_state.instructor_authenticated:
@@ -529,6 +502,9 @@ if st.session_state.instructor_authenticated:
                 st.code((r.text or "")[:1000], language="json")
             except Exception as e:
                 st.exception(e)
+
+
+
 
 st.title("⚖️ EUCapML Case Tutor")
 st.caption(f"Model answer prevails in doubt. Sources: EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet. • Build: {APP_HASH}")
