@@ -420,6 +420,21 @@ def build_chat_messages(chat_history: List[Dict], model_answer: str, sources_blo
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="EUCapML Case Tutor", page_icon="⚖️", layout="wide")
+# 🔐 Password protection
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title("🔐 EUCapML Case Tutor Login")
+    pin_input = st.text_input("Enter your student PIN", type="password")
+    correct_pin = st.secrets.get("STUDENTS_PIN", "")
+
+    if pin_input == correct_pin:
+        st.session_state.authenticated = True
+        st.experimental_rerun()
+    elif pin_input:
+        st.error("Incorrect PIN. Please try again.")
+    st.stop()
 st.title("⚖️ EUCapML Case Tutor")
 st.caption(f"Model answer prevails in doubt. Sources: EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet. • Build: {APP_HASH}")
 
