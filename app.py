@@ -420,7 +420,7 @@ def build_chat_messages(chat_history: List[Dict], model_answer: str, sources_blo
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="EUCapML Case Tutor", page_icon="⚖️", layout="wide")
-    st.title("🔐 EUCapML Case Tutor Login")
+st.title("🔐 EUCapML Case Tutor Login")
     pin_input = st.text_input("Enter your student PIN", type="password")
 
     try:
