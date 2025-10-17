@@ -498,9 +498,9 @@ if st.session_state.instructor_authenticated:
         st.header("⚙️ Instructor Settings")
         api_key = (st.secrets.get("GROQ_API_KEY") if hasattr(st, "secrets") else None) or os.getenv("GROQ_API_KEY")
         if api_key:
-            st.text_input("GROQ API Key", value="Provided via secrets/env", type="password", disabled=True)
+            st.text_input("GROQ API Key", value="Provided via secrets/env", type="password", disabled=True, key="groq_api_key_display")
         else:
-            api_key = st.text_input("GROQ API Key", type="password", help="Set GROQ_API_KEY in Streamlit Secrets for production.")
+            api_key = st.text_input("GROQ API Key", type="password", help="Set GROQ_API_KEY in Streamlit Secrets for production.", key="groq_api_key_input")
 
         model_name = st.selectbox(
             "Model (free)",
