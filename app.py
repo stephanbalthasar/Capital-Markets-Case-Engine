@@ -417,6 +417,7 @@ import requests
 st.set_page_config(page_title="EUCapML Case Tutor", page_icon="⚖️", layout="wide")
 
 def require_login():
+    
     """Render only the PIN prompt until the user is authenticated."""
     st.session_state.setdefault("authenticated", False)
     st.session_state.setdefault("just_logged_in", False)
@@ -447,11 +448,10 @@ def require_login():
         if pin_input and pin_input == correct_pin:
             st.session_state.authenticated = True
             st.session_state.just_logged_in = True
-    except KeyError:
-        st.error("STUDENT_PIN not found in secrets. Configure it in .streamlit/secrets.toml.")
-        st.stop()
-        st.success("PIN accepted. Loading…")
-        st.rerun()
+            st.success("PIN accepted. Loading…")
+            st.rerun()
+        else:
+            st.stop()
 
 # Not authenticated yet → show only the login UI and stop
 st.stop()
