@@ -27,10 +27,14 @@ def load_course_manual_text(pdf_path):
         text += page.get_text()
     return text
 
-# Load text from a file
+# Load text from a file with fallback encoding
 def load_text(file_path):
-    with open(file_path, "r", encoding="utf-8") as f:
-        return f.read()
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except UnicodeDecodeError:
+        with open(file_path, "r", encoding="latin-1") as f:
+            return f.read()
 
 # Generate feedback using Groq API (placeholder function)
 def generate_feedback(student_answer, model_answer, course_manual_text, case_text):
