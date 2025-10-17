@@ -128,7 +128,7 @@ def main():
         return
 
     # Main App Interface
-    st.image(LOGO_PATH, width=150)
+    st.image(LOGO_PATH, width=240)
     st.title("EUCapML Case Tutor")
 
     case_choice = st.selectbox("Select a case", list(CASE_FILES.keys()))
