@@ -416,38 +416,49 @@ import requests
 
 st.set_page_config(page_title="EUCapML Case Tutor", page_icon="⚖️", layout="wide")
 
-# Student login
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
+def require_login():
+    """Render only the PIN prompt until the user is authenticated."""
+    st.session_state.setdefault("authenticated", False)
+    st.session_state.setdefault("just_logged_in", False)
 
-if not st.session_state.authenticated:
-    
+    if st.session_state.authenticated:
+        return  # Already logged in
+
+    # --- Login UI (only thing visible pre-auth) ---
     logo_col, title_col = st.columns([1, 5])
-
-import os
-
-logo_col, title_col = st.columns([1, 5])
-with logo_col:
-    logo_path = "assets/logo.png"
-    try:
-        if os.path.exists(logo_path):
-            st.image(logo_path, width=240)
-        else:
+    with logo_col:
+        logo_path = "assets/logo.png"
+        try:
+            if os.path.exists(logo_path):
+                st.image(logo_path, width=240)
+            else:
+                st.markdown("### ⚖️ EUCapML Case Tutor")
+        except Exception as e:
             st.markdown("### ⚖️ EUCapML Case Tutor")
-    except Exception as e:
-        st.markdown("### ⚖️ EUCapML Case Tutor")
-        st.warning(f"Logo image could not be loaded: {e}")
+            st.warning(f"Logo image could not be loaded: {e}")
 
-with title_col:
-    st.title("EUCapML Case Tutor")    
-        
+    with title_col:
+        st.title("EUCapML Case Tutor")
+
     pin_input = st.text_input("Enter your student PIN", type="password")
 
     try:
         correct_pin = st.secrets["STUDENT_PIN"]
     except KeyError:
-        st.error("STUDENT_PIN not found in secrets. Please configure it in .streamlit/secrets.toml.")
+        st.error("STUDENT_PIN not found in secrets. Configure it in .streamlit/secrets.toml.")
         st.stop()
+
+    if pin_input and pin_input == correct_pin:
+        st.session_state.authenticated = True
+        st.session_state.just_logged_in = True
+        st.success("PIN accepted. Loading…")
+        st.rerun()
+
+    # Not authenticated yet → show nothing else
+    st.stop()
+
+# Enforce login early — nothing else should render before this
+require_login()
 
     if pin_input == correct_pin:
         st.session_state.authenticated = True
