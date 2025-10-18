@@ -1,4 +1,3 @@
-streamlit
 PyMuPDF
 requests
 streamlit>=1.36
