@@ -1,6 +1,6 @@
+streamlit>=1.36
 PyMuPDF
 requests
-streamlit>=1.36
 numpy
 scikit-learn
 sentence-transformers
