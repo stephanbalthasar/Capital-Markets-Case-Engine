@@ -1,5 +1,5 @@
 # app.py
-# Neon Case Tutor — Free LLM (Groq) + Web-Grounded Feedback & Chat
+# EUCapML Case Tutor — University of Bayreuth
 # - Free LLM via Groq (llama-3.1-8b/70b-instant): no credits or payments
 # - Web retrieval from EUR-Lex, CURIA, ESMA, BaFin, Gesetze-im-Internet
 # - Hidden model answer is authoritative; citations [1], [2] map to sources
@@ -396,7 +396,9 @@ def system_guardrails():
         "You are a careful EU/German capital markets law tutor. "
         "Always ground your answers in the MODEL ANSWER (authoritative) AND the provided web SOURCES. "
         "If there is any conflict or doubt, follow the MODEL ANSWER and explain briefly. "
-        "Cite sources as [1], [2], etc., matching the SOURCES list exactly. Be concise and didactic."
+        "If STUDENT ANSWER contains incorrect statements, point this out and explain how these are incorrect. "
+        "If STUDENT ANSWER misses central concepts, point this out and explain why they are relevant. "
+        "Cite sources as [1], [2], etc., matching the SOURCES list exactly. Cite specific parts of COURSE BOOKLET so students can follow up. Do not refer to MODEL ANSWER as students cannot access it. Be concise and didactic."
     )
 
 def build_feedback_prompt(student_answer: str, rubric: Dict, model_answer: str, sources_block: str, excerpts_block: str) -> str:
