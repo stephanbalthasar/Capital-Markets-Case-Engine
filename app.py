@@ -595,7 +595,7 @@ with colA:
                         st.markdown(f"- {line}")
 
 with colB:
-    st.markdown("### 💬 Tutor Chat (web‑grounded)")
+    st.markdown("### 💬 Tutor Chat")
     st.caption("Ask follow-up questions. Answers cite authoritative sources and follow the model answer.")
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
