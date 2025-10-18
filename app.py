@@ -450,18 +450,14 @@ st.set_page_config(page_title="EUCapML Case Tutor", page_icon="⚖️", layout="
 # Student login
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
-
+    
 if not st.session_state.authenticated:
-    
-    logo_col, title_col = st.columns([1, 5])
-
-with logo_col:
-    st.image("assets/logo.png", width=240)
-
-with title_col:
-    st.title("EUCapML Case Tutor")
-    
-    
+    with st.container():
+        logo_col, title_col = st.columns([1, 5])
+        with logo_col:
+            st.image("assets/logo.png", width=240)
+        with title_col:
+            st.title("EUCapML Case Tutor")
     
     pin_input = st.text_input("Enter your student PIN", type="password")
 
