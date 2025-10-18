@@ -151,19 +151,6 @@ def coverage_score(answer: str, issue: Dict) -> Tuple[int, List[str]]:
     score = int(round(issue["points"] * (len(hits) / max(1, len(issue["keywords"])))))
     return score, hits
 
-def detect_citation_issues(answer: str) -> Dict[str, List[str]]:
-    issues, suggestions = [], []
-    a = answer
-    # Art 3(1) PR (public offer) vs Art 3(3) PR (admission to trading)
-    if re.search(r"\bart\.?\s*3\s*\(\s*1\s*\)\s*(pr|prospectus)", a, flags=re.IGNORECASE):
-        issues.append("You cited Art 3(1) PR for admission to trading (public-offer rule).")
-        suggestions.append("For admission to a regulated market, cite Art 3(3) PR; also Art 20/21 PR on approval/publication.")
-    # § 40 WpHG vs § 43(1) WpHG (statement of intent)
-    if re.search(r"§\s*40\s*wphg", a, flags=re.IGNORECASE):
-        issues.append("You cited § 40 WpHG. The statement of intent is § 43(1) WpHG.")
-        suggestions.append("Replace § 40 WpHG with § 43(1) WpHG.")
-    return {"issues": issues, "suggestions": suggestions}
-
 def detect_substantive_flags(answer: str) -> List[str]:
     flags = []
     low = answer.lower()
@@ -195,7 +182,6 @@ def summarize_rubric(student_answer: str, model_answer: str, backend, required_i
         if missed:
             missing.append({"issue": row["issue"], "missed_keywords": missed})
 
-    citation_issues = detect_citation_issues(student_answer)
     substantive_flags = detect_substantive_flags(student_answer)
 
     return {
@@ -204,10 +190,9 @@ def summarize_rubric(student_answer: str, model_answer: str, backend, required_i
         "final_score": round(final, 1),
         "per_issue": per_issue,
         "missing": missing,
-        "citation_issues": citation_issues,
-        "substantive_flags": substantive_flags,
+        "substantive_flags": substantive_flags,   # keep this if you still want it
     }
-
+    
 # ---------------- Web Retrieval (RAG) ----------------
 ALLOWED_DOMAINS = {
     "eur-lex.europa.eu",        # EU law (MAR, PR, MiFID II, TD)
@@ -398,7 +383,10 @@ def system_guardrails():
         "If there is any conflict or doubt, follow the MODEL ANSWER and explain briefly. "
         "If STUDENT ANSWER contains incorrect statements, point this out and explain how these are incorrect. "
         "If STUDENT ANSWER misses central concepts, point this out and explain why they are relevant. "
-        "Cite sources as [1], [2], etc., matching the SOURCES list exactly. Cite specific parts of COURSE BOOKLET so students can follow up. Do not refer to MODEL ANSWER as students cannot access it. Be concise and didactic."
+        "Cite sources as [1], [2], etc., matching the SOURCES list exactly. Cite specific parts of COURSE BOOKLET so students can follow up. Do not refer to MODEL ANSWER as students cannot access it. "
+        "Summarize or paraphrase concepts only. If the user asks to see the model answer, refuse politely. "
+        "Do not refer to the fact that a hidden model answer exists. "
+        "Be concise and didactic. "
     )
 
 def build_feedback_prompt(student_answer: str, rubric: Dict, model_answer: str, sources_block: str, excerpts_block: str) -> str:
@@ -411,9 +399,6 @@ RUBRIC SCORES:
 - Similarity to model answer: {rubric['similarity_pct']}%
 - Issue coverage: {rubric['coverage_pct']}%
 - Overall score: {rubric['final_score']}%
-
-DETECTED MIS-CITATIONS:
-{json.dumps(rubric['citation_issues'], ensure_ascii=False)}
 
 DETECTED SUBSTANTIVE FLAGS:
 {json.dumps(rubric['substantive_flags'], ensure_ascii=False)}
@@ -428,8 +413,8 @@ EXCERPTS (quote sparingly; use [n] to cite):
 {excerpts_block}
 
 TASK:
-Provide <220 words of numbered, actionable feedback. Correct mis-citations (e.g., Art 3(1) PR -> Art 3(3) PR; § 40 WpHG -> § 43(1) WpHG).
-Explain briefly why, with citations [n]. If sources diverge, follow the MODEL ANSWER.
+Provide actionable educational feedback. Write no more than 400 words. End with a concluding sentence. Do not start new sections. Correct mis-citations (e.g., Art 3(1) PR -> Art 3(3) PR; § 40 WpHG -> § 43(1) WpHG).
+Explain briefly why, with citations [n]. Where students cite wrong legal provisions, correct. Where students make false statements, point this out and explain how they are wrong. If central aspects are missing from the student's answer, point this out and explain why it is relevant. If sources diverge, follow the MODEL ANSWER.
 """
 
 def build_chat_messages(chat_history: List[Dict], model_answer: str, sources_block: str, excerpts_block: str) -> List[Dict]:
@@ -442,12 +427,66 @@ def build_chat_messages(chat_history: List[Dict], model_answer: str, sources_blo
     msgs.append({"role": "system", "content": "RELEVANT EXCERPTS (quote sparingly):\n" + excerpts_block})
     return msgs
 
+# ------------------------------ Chat Helpers ----------
+def render_sources_used(source_lines: list[str]) -> None:
+    with st.expander("📚 Sources used", expanded=False):
+        if not source_lines:
+            st.write("— no web sources available —")
+            return
+        for line in source_lines:
+            st.markdown(f"- {line}")
+
+def clear_chat_draft():
+    # Clear the persistent composer safely during the button's on_click callback
+    st.session_state["chat_draft"] = ""
+
+# --- Chat callbacks ------------------------------------------------------------
+def clear_chat_draft():
+    # Clear the persistent composer safely
+    st.session_state["chat_draft"] = ""
+    # optional: st.rerun()
+
+def reset_chat():
+    # Wipes the entire conversation (answers + questions + their sources)
+    st.session_state["chat_history"] = []
+    # optional: also clear the draft:
+    # st.session_state["chat_draft"] = ""
+    st.rerun()  # ensure immediate re-render
+
+def clear_last_exchange():
+    """
+    Removes the last assistant message and, if present, the immediately preceding user message.
+    Useful if the last answer was off-topic or leaked style.
+    """
+    hist = list(st.session_state.get("chat_history", []))
+    if not hist:
+        return
+    # Pop trailing whitespace/system noise if any (defensive)
+    while hist and hist[-1].get("role") not in ("user", "assistant"):
+        hist.pop()
+
+    # Remove last assistant message (if any)
+    if hist and hist[-1].get("role") == "assistant":
+        hist.pop()
+
+    # Remove the preceding user question (if any)
+    if hist and hist[-1].get("role") == "user":
+        hist.pop()
+
+    st.session_state["chat_history"] = hist
+    st.rerun()
+
 # ---------------- UI ----------------
 import streamlit as st
 import os
 import requests
 
-st.set_page_config(page_title="EUCapML Case Tutor", page_icon="⚖️", layout="wide")
+st.set_page_config(
+    page_title="EUCapML Case Tutor", 
+    page_icon="⚖️", 
+    layout="wide",
+    initial_sidebar_state="collapsed",   # ← collapsed by default
+)
 
 # Student login
 if "authenticated" not in st.session_state:
@@ -516,8 +555,8 @@ with st.sidebar:
             st.exception(e)
 
 # Main UI
-st.title("⚖️ EUCapML Case Tutor")
-st.caption("Model answer prevails in doubt. Sources: EUR‑Lex, CURIA, ESMA, BaFin, Gesetze‑im‑Internet.")
+st.image("assets/logo.png", width=240)
+st.title("EUCapML Case Tutor")
 
 with st.expander("📚 Case (click to read)"):
     st.write(CASE)
@@ -544,10 +583,9 @@ with colA:
                     top_pages, source_lines = retrieve_snippets_with_manual(student_answer, MODEL_ANSWER, pages, backend, top_k_pages=max_sources, chunk_words=170)
 
             # Metrics
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Semantic Similarity", f"{rubric['similarity_pct']}%")
-            m2.metric("Issue Coverage", f"{rubric['coverage_pct']}%")
-            m3.metric("Overall Score", f"{rubric['final_score']}%")
+            m1, m2 = st.columns(2)
+            m1.metric("Issue Coverage", f"{rubric['coverage_pct']}%")
+            m2.metric("Overall Score", f"{rubric['final_score']}%")
 
             # Breakdown
             with st.expander("🔬 Issue-by-issue breakdown"):
@@ -558,15 +596,11 @@ with colA:
                     st.markdown(f"- ⛔ Missing: {', '.join(miss) if miss else '—'}")
 
             # Deterministic corrections
-            if rubric["citation_issues"]["issues"] or rubric["substantive_flags"]:
-                st.markdown("### 🛠️ Detected corrections")
-                for it in rubric["citation_issues"]["issues"]:
-                    st.markdown(f"- ❗ {it}")
-                for sg in rubric["citation_issues"]["suggestions"]:
-                    st.markdown(f"  - ✔️ **Suggestion:** {sg}")
+            if rubric["substantive_flags"]:
+                st.markdown("### ⚖️ Detected substantive flags")
                 for fl in rubric["substantive_flags"]:
                     st.markdown(f"- ⚖️ {fl}")
-
+            
             # LLM narrative feedback
             sources_block = "\n".join(source_lines) if source_lines else "(no web sources available)"
             excerpts_items = []
@@ -597,24 +631,42 @@ with colA:
 with colB:
     st.markdown("### 💬 Tutor Chat")
     st.caption("Ask follow-up questions. Answers cite authoritative sources and follow the model answer.")
+
+    # --- state ---
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
+    if "chat_draft" not in st.session_state:
+        st.session_state.chat_draft = ""
 
-    for msg in st.session_state.chat_history:
-        if msg["role"] in ("user", "assistant"):
-            with st.chat_message(msg["role"]):
-                st.write(msg["content"])
+    # --- composer ---
+    c1, c2, c3, c4 = st.columns([6, 1, 1, 2])
+    with c1:
+        st.text_area(
+            "Ask a question about your feedback, the law, or how to improve…",
+            key="chat_draft",
+            height=90
+        )
+    with c2:
+        send = st.button("Send", use_container_width=True, key="send_btn")
+    with c3:
+        st.button("Clear", use_container_width=True, key="clear_btn", on_click=clear_chat_draft)
+    with c4:
+        st.button("Reset chat", use_container_width=True, key="reset_chat_btn", on_click=reset_chat)
+         
+    # --- handle send: UPDATE STATE FIRST, DO NOT RENDER INLINE ---
+    if send and st.session_state.chat_draft.strip():
+        user_q = st.session_state.chat_draft
+        st.session_state.chat_history.append({"role": "user", "content": user_q})
 
-    user_q = st.chat_input("Ask a question about your feedback, the law, or how to improve…")
-    if user_q:
         with st.spinner("Retrieving sources and drafting a grounded reply..."):
             backend = load_embedder()
             top_pages, source_lines = [], []
             if enable_web:
                 pages = collect_corpus(student_answer, user_q, max_fetch=20)
-                top_pages, source_lines = retrieve_snippets(
+                top_pages, source_lines = retrieve_snippets_with_manual(
                     (student_answer or "") + "\n\n" + user_q,
-                    MODEL_ANSWER, pages, backend, top_k_pages=max_sources, chunk_words=170
+                    MODEL_ANSWER, pages, backend,
+                    top_k_pages=max_sources, chunk_words=170
                 )
 
             sources_block = "\n".join(source_lines) if source_lines else "(no web sources available)"
@@ -624,14 +676,11 @@ with colB:
                     excerpts_items.append(f"[{i+1}] {sn}")
             excerpts_block = "\n\n".join(excerpts_items[: max_sources * 3]) if excerpts_items else "(no excerpts)"
 
-            st.session_state.chat_history.append({"role": "user", "content": user_q})
-
             if api_key:
                 msgs = build_chat_messages(st.session_state.chat_history, MODEL_ANSWER, sources_block, excerpts_block)
                 reply = call_groq(msgs, api_key, model_name=model_name, temperature=temp, max_tokens=600)
             else:
                 reply = None
-
             if not reply:
                 reply = (
                     "I couldn’t reach the LLM. Here are the most relevant source snippets:\n\n"
@@ -639,13 +688,31 @@ with colB:
                     + "\n\nIn doubt, follow the model answer."
                 )
 
-            with st.chat_message("assistant"):
-                st.write(reply)
+        # Append the assistant message WITH its per-message sources
+        st.session_state.chat_history.append({
+            "role": "assistant",
+            "content": reply or "",
+            "sources": source_lines[:]  # persistent per-message list
+        })
 
-            st.session_state.chat_history.append({"role": "assistant", "content": reply})
+    # --- render FULL history AFTER updates so latest sources appear immediately ---
+    for msg in st.session_state.chat_history:
+        role = msg.get("role", "")
+        if role in ("user", "assistant"):
+            with st.chat_message(role):
+                st.write(msg.get("content", ""))
+                if role == "assistant":
+                    # Per-message "Sources used"
+                    st.markdown("#### 📚 Sources used")
+                    srcs = msg.get("sources", [])
+                    if not srcs:
+                        st.write("— no web sources available —")
+                    else:
+                        for line in srcs:
+                            st.markdown(f"- {line}")
 
 st.divider()
 st.markdown(
-    "ℹ️ **Notes**: The app grounds answers in authoritative sources and the hidden model answer. "
+    "ℹ️ **Notes**: This app is authored by Stephan Balthasar. It provides feedback and chat answers based on web sources and a model answer. "
     "If web sources appear to diverge, the tutor explains the divergence but follows the model answer."
 )
