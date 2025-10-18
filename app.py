@@ -456,7 +456,7 @@ if not st.session_state.authenticated:
     logo_col, title_col = st.columns([1, 5])
 
 with logo_col:
-    st.image("assets/logo.png", width=240)
+    st.image("assets/logo.png", width=60)
 
 with title_col:
     st.title("EUCapML Case Tutor")
