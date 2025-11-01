@@ -9,11 +9,11 @@ import re
 import json
 import hashlib
 import pathlib
-import fitz  # PyMuPDF
 from typing import List, Dict, Tuple
 from urllib.parse import quote_plus, urlparse
 import numpy as np
 import streamlit as st
+import statistics as stats
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 
@@ -22,6 +22,94 @@ from bs4 import BeautifulSoup
 
 # ---------------- Build fingerprint (to verify latest deployment) ----------------
 APP_HASH = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:10]
+
+# ---------- Public helpers you will call from the app ----------
+def bold_section_headings(reply: str) -> str:
+    """
+    Make core section headings bold and ensure a blank line after each.
+    Safe to call on already-formatted text (idempotent).
+    """
+    if not reply:
+        return reply
+    import re
+
+    # 1) Canonicalise a few heading variants (defensive)
+    reply = re.sub(r"(?im)^\s*CLAIMS\s*:\s*$", "Student's Core Claims:", reply)
+    
+    # 2) Bold-format the canonical headings
+    patterns = {
+        r"(?im)^\s*Student's Core Claims:\s*$": "**Student's Core Claims:**",
+        r"(?im)^\s*Missing Aspects:\s*$":        "**Missing Aspects:**",
+        r"(?im)^\s*Suggestions:\s*$":            "**Suggestions:**",
+        r"(?im)^\s*Conclusion:\s*$":             "**Conclusion:**",
+    }
+    for pat, repl in patterns.items():
+        reply = re.sub(pat, repl, reply)
+
+    # 3) Guarantee exactly one newline after any bold heading
+    reply = re.sub(
+        r"(?m)^(?:\*\*Student's Core Claims:\*\*|\*\*Missing Aspects:\*\*|\*\*Suggestions:\*\*|\*\*Conclusion:\*\*)(?:[ \t]*)$",
+        lambda m: m.group(0) + "\n",
+        reply,
+    )
+
+    # 4) Collapse excessive blank lines
+    reply = re.sub(r"\n{3,}", "\n\n", reply).strip()
+    return reply
+
+def _anchors_from_model(model_answer_slice: str, cap: int = 20) -> list[str]:
+    s = model_answer_slice or ""
+    acr = re.findall(r"\b[A-ZÄÖÜ]{2,6}\b", s)                        # MAR, PR, TD, WpHG, ...
+    art = re.findall(r"(?i)\b(?:Art\.?|Article)\s*\d+(?:\([^)]+\))*", s)
+    par = re.findall(r"§\s*\d+[a-z]?(?:\([^)]+\))*", s)
+    # de‑duplicate, keep by original order
+    seen, out = set(), []
+    for t in acr + art + par:
+        t = re.sub(r"\s+", " ", t.strip())
+        if t and t not in seen:
+            seen.add(t); out.append(t)
+        if len(out) >= cap:
+            break
+    return out
+
+def prune_redundant_improvements(student_answer: str, reply: str) -> str:
+    """
+    Remove bullets that recommend adding content clearly present in the student's answer.
+    Uses simple anchor regexes to detect presence.
+    """
+    if not reply:
+        return reply
+    import re
+    anchors = [
+        r"\bLafonta\b",
+        r"\bArt(?:icle)?\s*7\s*\(\s*2\s*\)\b",
+        r"\breasonably\s+be\s+expected\s+to\s+occur\b",
+        r"\bArt(?:icle)?\s*7\s*\(\s*4\s*\)\b",
+        r"\bArt(?:icle)?\s*17\s*\(\s*1\s*\)\b",
+        r"\bArt(?:icle)?\s*17\s*\(\s*4\s*\)\b",
+    ]
+    stu = student_answer.lower()
+
+    def present(pat: str) -> bool:
+        return re.search(pat, stu, flags=re.I) is not None
+
+    m = re.search(r"(Missing Aspects:\s*)(.*?)(\n(?:Conclusion|📚|Sources used|$))",
+        reply,
+        flags=re.S | re.I
+    )    
+    if not m:
+        return reply
+
+    head, block, tail = m.group(1), m.group(2), m.group(3)
+    lines = [ln for ln in re.split(r"\n\s*•\s*", block.strip()) if ln.strip()]
+    kept = []
+    for ln in lines:
+        # Drop bullet if any anchor it references is already present in student answer
+        if any(re.search(p, ln, re.I) and present(p) for p in anchors):
+            continue
+        kept.append(f"• {ln.strip()}")
+    new_block = ("\n".join(kept) + "\n") if kept else "—\n"
+    return reply.replace(m.group(0), head + new_block + tail)
 
 # ---------------- Embeddings ----------------
 @st.cache_resource(show_spinner=False)
@@ -272,17 +360,89 @@ def _auto_issues_from_text(text: str, max_issues: int = 8) -> list[dict]:
 
     return issues
 # ---------- Main extractor (no hard-coded topics) ----------
+import re
+from sklearn.feature_extraction.text import TfidfVectorizer
+import numpy as np
+
+def improved_keyword_extraction(text: str, max_keywords: int = 20) -> list[str]:
+    if not text:
+        return []
+
+    # Extract law acronyms
+    acronyms = re.findall(r"\b(?:MAR|PR|MiFID II|TD|WpHG|WpÜG)\b", text)
+
+    # Extract articles with law names (e.g. "article 7(1) MAR")
+    articles = re.findall(
+        r"(?i)\b(?:Art\.?|Article)\s*\d+(?:\([^)]+\))*\s*(MAR|PR|MiFID II|TD|WpHG|WpÜG)",
+        text
+    )
+    article_matches = re.findall(
+        r"(?i)\b(?:Art\.?|Article)\s*\d+(?:\([^)]+\))*",
+        text
+    )
+    full_articles = []
+    for match in article_matches:
+        for law in acronyms:
+            if law in text:
+                full_articles.append(f"{match.strip()} {law}")
+                break
+    # Extract paragraphs with law names (e.g. "§ 33 WpHG")
+    paragraph_matches = re.findall(r"§\s*\d+[a-z]?(?:\([^)]+\))*", text)
+    full_paragraphs = []
+    for match in paragraph_matches:
+        for law in acronyms:
+            if law in text and law in ["WpHG", "WpÜG"]:
+                full_paragraphs.append(f"{match.strip()} {law}")
+                break
+
+    # Extract ECJ cases and named cases
+    cases = re.findall(r"C[-–—]?\d+/\d+", text)
+    named_cases = re.findall(r"\bLafonta\b|\bGeltl\b|\bHypo Real Estate\b", text, flags=re.I)
+
+    # Combine legal anchors
+    legal_anchors = full_articles + full_paragraphs + acronyms + cases + named_cases
+
+    # TF-IDF for generic legal terms
+    vec = TfidfVectorizer(ngram_range=(1, 3), max_features=3000, stop_words="english")
+    X = vec.fit_transform([text])
+    terms = vec.get_feature_names_out()
+    tfidf_scores = X.toarray().flatten()
+
+    # Filter out trivial or malformed terms
+    blacklist = {
+        "requires", "pursuant", "students", "question", "mention", "meaning",
+        "agreement", "shares", "neon", "gerry", "company", "framework", "cfa"
+    }
+    generic_terms = []
+    for term, score in zip(terms, tfidf_scores):
+        term_clean = term.strip().lower()
+        if len(term_clean) < 3 or term_clean in blacklist:
+            continue
+        if re.search(r"\b(?:requires|pursuant|students|question|mention|meaning)\b", term_clean):
+            continue
+        generic_terms.append((term, score))
+
+    generic_terms_sorted = sorted(generic_terms, key=lambda x: -x[1])
+    top_generic_terms = [term for term, _ in generic_terms_sorted[:max_keywords]]
+
+    # Combine and deduplicate
+    all_keywords = legal_anchors + top_generic_terms
+    seen = set()
+    final_keywords = []
+    for kw in all_keywords:
+        kw_norm = re.sub(r"\s+", " ", kw.strip())
+        if kw_norm.lower() not in seen:
+            seen.add(kw_norm.lower())
+            final_keywords.append(kw_norm)
+
+    return final_keywords[:max_keywords]
+    
 def extract_issues_from_model_answer(model_answer: str, llm_api_key: str) -> list[dict]:
-    """
-    Try LLM with strict JSON contract (with two repair retries).
-    If it still fails, fall back to automatic text mining (no hard-coded issues).
-    """
-    # Guard
     model_answer = (model_answer or "").strip()
     if not model_answer:
         return []
 
-    # 1) LLM attempt with strict JSON instructions
+    # Attempt LLM extraction
     sys = "Respond with VALID JSON only: either an array or {\"issues\": [...]}. No prose, no fences."
     user = (
         "Extract the key issues from the MODEL ANSWER.\n"
@@ -294,23 +454,19 @@ def extract_issues_from_model_answer(model_answer: str, llm_api_key: str) -> lis
         {"role": "system", "content": sys},
         {"role": "user", "content": user},
     ]
+
     raw = call_groq(messages, api_key=llm_api_key, model_name="llama-3.1-8b-instant", temperature=0.0, max_tokens=900)
     parsed = _try_parse_json(raw)
     issues = _coerce_issues(parsed)
 
-    # 2) If parsing failed or no items, try a small JSON-repair step once
-    if not issues and raw:
-        repair_msgs = [
-            {"role": "system", "content": "Fix JSON. Output VALID JSON only (no prose, no fences)."},
-            {"role": "user", "content": f"Make this into valid JSON array (or {{\"issues\": [...]}}):\n{raw}"},
-        ]
-        raw2 = call_groq(repair_msgs, api_key=llm_api_key, model_name="llama-3.1-8b-instant", temperature=0.0, max_tokens=900)
-        parsed2 = _try_parse_json(raw2)
-        issues = _coerce_issues(parsed2)
-
-    # 3) Final fallback: automatic issue mining from text (generic & scalable)
+    # Fallback to improved keyword extraction
     if not issues:
-        issues = _auto_issues_from_text(model_answer, max_issues=8)
+        keywords = improved_keyword_extraction(model_answer, max_keywords=20)
+        issues = [{
+            "name": "Key Legal Concepts",
+            "keywords": keywords,
+            "importance": 10
+        }]
 
     return issues
 
@@ -349,10 +505,10 @@ def generate_rubric_from_model_answer(student_answer: str, model_answer: str, ba
 
     missing = []
     for row in per_issue:
-        missed = [kw for kw in row["keywords_total"] if kw not in row["keywords_hit"]]
+        missed = [kw for kw in row["keywords_total"] if not keyword_present(student_answer, kw)]
         if missed:
             missing.append({"issue": row["issue"], "missed_keywords": missed})
-
+    
     substantive_flags = detect_substantive_flags(student_answer)
 
     return {
@@ -402,12 +558,42 @@ def canonicalize(s: str, strip_paren_numbers: bool = False) -> str:
     s = re.sub(r"[^a-z0-9§]", "", s)
     return s
 
+import re
+
+
 def keyword_present(answer: str, kw: str) -> bool:
-    ans_can = canonicalize(answer, strip_paren_numbers=True)
-    kw_can = canonicalize(kw, strip_paren_numbers=True)
-    if kw.strip().lower().startswith(("§", "art")):
-        return kw_can in ans_can
-    return normalize_ws(kw).lower() in normalize_ws(answer).lower()
+    """
+    Detects presence of compound legal references like 'article 17(4)(a) MAR' or '§ 33 WpHG'
+    even if the student mentions the article/paragraph and the law name separately.
+    """
+    import re
+
+    def canonicalize(s: str) -> str:
+        s = s.lower()
+        s = s.replace("art.", "art").replace("article", "art").replace("–", "-")
+        s = s.replace("wpüg", "wpüg")
+        s = re.sub(r"\s+", "", s)
+        s = re.sub(r"[^\w§]", "", s)
+        return s
+
+    ans_can = canonicalize(answer)
+    kw_can = canonicalize(kw)
+
+    # Direct match
+    if kw_can in ans_can:
+        return True
+
+    # Split compound keywords like 'article 17(4)(a) MAR'
+    parts = kw.strip().split()
+    if len(parts) >= 2:
+        main_part = " ".join(parts[:-1])
+        law_part = parts[-1]
+        main_can = canonicalize(main_part)
+        law_can = canonicalize(law_part)
+        return main_can in ans_can and law_can in ans_can
+
+    # Fallback: check if keyword appears loosely
+    return canonicalize(kw) in ans_can
 
 def coverage_score(answer: str, issue: Dict) -> Tuple[int, List[str]]:
     hits = [kw for kw in issue["keywords"] if keyword_present(answer, kw)]
@@ -420,6 +606,357 @@ def detect_substantive_flags(answer: str) -> List[str]:
     if "always delay" in low or re.search(r"\b(can|may)\s+always\s+delay\b", low):
         flags.append("Delay under Art 17(4) MAR is conditional: (a) legitimate interest, (b) not misleading, (c) confidentiality ensured.")
     return flags
+
+# =======================
+# AGREEMENT MODE + TAG NORMALISATION (general, scalable)
+# =======================
+
+def in_agreement_mode(rubric: dict, sim_thresh: float = 85.0, cov_thresh: float = 70.0) -> bool:
+    """
+    True if the student's answer is highly aligned with the model answer.
+    Uses your rubric similarity & coverage (already computed).
+    """
+    try:
+        return (rubric or {}).get("similarity_pct", 0.0) >= sim_thresh and \
+               (rubric or {}).get("coverage_pct", 0.0) >= cov_thresh
+    except Exception:
+        return False
+def agreement_prompt_prelude(agreement: bool) -> str:
+    """
+    Guidance injected into the LLM prompt so it frames extras as Suggestions,
+    never as errors, when the answer is aligned.
+    """
+    if not agreement:
+        return ""
+    return (
+        "IMPORTANT RULES (agreement mode):\n"
+        "- If the student's claim matches the MODEL ANSWER, label it \"Correct\".\n"
+        "- If you want to add extra legal points (other provisions, edge cases, policy), put them under a section titled "
+        "\"Suggestions\" (or \"Further Considerations\"). Do NOT put them under 'Mistakes'.\n"
+        "- Never mark a claim as 'Incorrect' unless it directly contradicts the MODEL ANSWER.\n\n"
+    )
+
+
+def _find_section(text: str, title_regex: str):
+    """
+    Return (head, body, tail, span) for the section whose title matches title_regex.
+    If not found, returns (None, None, None, None).
+    """
+    import re
+    m = re.search(
+        rf"({title_regex}\s*)(.*?)(\n(?:Student's Core Claims:|Mistakes:|Missing Aspects:|Suggestions:|Conclusion|📚|Sources used|$))",
+        text,
+        flags=re.S | re.I,
+    )
+    if not m:
+        return None, None, None, None
+    return m.group(1), m.group(2), m.group(3), m.span(0)
+
+def _neutralise_error_tone(line: str) -> str:
+    """
+    Turn blamey phrasing into 'suggestion' tone.
+    """
+    import re
+    s = line
+    s = re.sub(r"\b[Tt]he student incorrectly (states|assumes|concludes)\b", "Consider also", s)
+    s = re.sub(r"\b[Tt]his is incorrect because\b", "Rationale:", s)
+    s = s.replace("is incorrect", "may be incomplete")
+    return s
+
+
+def merge_to_suggestions(reply: str, student_answer: str, activate: bool = True) -> str:
+    """
+    When activated (agreement mode), remove 'Mistakes' and 'Missing Aspects'
+    sections and merge their content into a neutral 'Suggestions:' section.
+    """
+    if not reply or not activate:
+        return reply
+
+    # 1) Extract both sections (if any)
+    inc_head, inc_body, inc_tail, inc_span = _find_section(reply, r"Mistakes:")
+    mis_head, mis_body, mis_tail, mis_span = _find_section(reply, r"Missing Aspects:")
+
+    if not any([inc_head, mis_head]):
+        return reply
+
+    # 2) Build a combined suggestions list
+    suggestions = []
+    suggestions += [f"• {ln.strip()}" for ln in (inc_body or "").splitlines() if ln.strip()]
+    suggestions += [f"• {ln.strip()}" for ln in (mis_body or "").splitlines() if ln.strip()]
+    suggestions = [_neutralise_error_tone(s) for s in suggestions]
+    # Keep short, informative suggestions
+    suggestions = suggestions[:8]
+
+    # 3) Remove original sections by cutting spans (from end to start)
+    parts = []
+    last = 0
+    cut_spans = []
+    if inc_span: cut_spans.append(inc_span)
+    if mis_span: cut_spans.append(mis_span)
+    for s, e in sorted(cut_spans):
+        parts.append(reply[last:s])
+        last = e
+    parts.append(reply[last:])
+    tmp = "".join(parts)
+
+    # 4) Insert Suggestions before Conclusion
+    import re
+    suggestions_block = ""
+    if suggestions:
+        suggestions_block = "Suggestions:\n" + "\n".join(suggestions) + "\n\n"
+    concl_sec = re.search(r"\n(?=Conclusion\b)", tmp, flags=re.I)
+    if concl_sec:
+        idx = concl_sec.start()
+        return tmp[:idx] + "\n" + suggestions_block + tmp[idx:]
+    # else append at end
+    return (tmp.rstrip() + "\n\n" + suggestions_block).rstrip() + "\n"
+
+
+def tidy_empty_sections(reply: str) -> str:
+    """
+    Remove headings that ended up empty after normalisation.
+    """
+    if not reply:
+        return reply
+    import re
+    # Remove empty sections like 'Missing Aspects:' followed by '—' or blank lines
+    reply = re.sub(r"(Missing Aspects:\s*)(?:—\s*|\s*)(?=\n(?:Conclusion|📚|Sources used|$))",
+                   "", reply, flags=re.S | re.I)
+    reply = re.sub(r"(Mistakes:\s*)(?:—\s*|\s*)(?=\n(?:Missing Aspects|Conclusion|📚|Sources used|$))",
+                   "", reply, flags=re.S | re.I)
+    reply = re.sub(r"(Suggestions:\s*)(?:—\s*|\s*)(?=\n(?:Conclusion|📚|Sources used|$))",
+                   "", reply, flags=re.S | re.I)
+    return reply
+
+# --- High‑recall presence detector for legal cites in the student's answer ---
+def _presence_set(student_answer: str, model_answer_slice: str) -> set[str]:
+    """
+    Build a set of 'present' markers we will trust for removing hallucinated 'missing'.
+    We collect both: (1) patterns found in the MODEL ANSWER (acronyms, Art/§ cites, C‑numbers),
+    and (2) their occurrences in the student's answer (case‑insensitive, hyphen tolerant).
+    """
+    ans = (student_answer or "")
+    ma  = (model_answer_slice or "")
+
+    # 1) pull potential anchors from the model answer (generic, no hard-coding to a domain)
+    acronyms = set(re.findall(r"\b[A-ZÄÖÜ]{2,6}\b", ma))           # MAR, PR, TD, WpHG, WpÜG, etc.
+    art_refs = set(re.findall(r"\b(?:Art\.?|Article)\s*\d+(?:\([^)]+\))*", ma, flags=re.I))
+    par_refs = set(re.findall(r"§\s*\d+[a-z]?(?:\([^)]+\))*", ma))
+    c_cases  = set(re.findall(r"C[\-‑–/]\s*\d+\s*/\s*\d+", ma))     # C-628/13, C‑628/13, etc.
+    names    = set(re.findall(r"\b[Ll]afonta\b|\b[Gg]eltl\b|\b[Hh]ypo\s+Real\s+Estate\b", ma))
+
+    # 2) normalise and build search patterns (tolerate dashed/non-breaking hyphen variants)
+    def norm(x: str) -> str:
+        x = re.sub(r"\s+", " ", x.strip())
+        return x
+
+    raw_markers = {norm(x) for x in (acronyms | art_refs | par_refs | c_cases | names) if x}
+    if not raw_markers:
+        return set()
+
+    # helper: hyphen-flexible pattern for ECJ case numbers
+    def hyflex(s: str) -> str:
+        s = re.escape(s)
+        # make all hyphens flexible; allow NBSP in "C‑628/13" variants
+        s = s.replace(r"C\-", r"C[\-‑–]?").replace(r"\s*/\s*", r"\s*/\s*")
+        return s
+
+    present = set()
+    for m in raw_markers:
+        pat = hyflex(m)
+        if re.search(pat, ans, flags=re.I):
+            present.add(m.lower())
+
+        # also handle relaxed variants for Art/Article, strip spaces like "Art 7(2)"
+        if re.match(r"(?i)^(art\.?|article)\s*\d", m):
+            simple = re.sub(r"(?i)^(art\.?|article)\s*", "", m)
+            if re.search(rf"(?i)\b(art\.?|article)\s*{re.escape(simple)}\b", ans):
+                present.add(m.lower())
+
+    return present
+
+def format_feedback_and_filter_missing(reply: str, student_answer: str, model_answer_slice: str, rubric: dict) -> str:
+    """
+    Reformats feedback into five clear sections:
+    - Student's Core Claims
+    - Mistakes
+    - Missing Aspects
+    - Suggestions
+    - Conclusion
+    Each section is formatted with bullet points and explanations where needed.
+    """
+    import re
+
+    if not reply:
+        return reply
+
+    # Normalize headings
+    reply = re.sub(r"(?im)^\\s*CLAIMS\\s*:\\s*$", "Student's Core Claims:", reply)
+    reply = re.sub(r"(?im)^\\s*Mistakes\\s*:\\s*$", "Mistakes:", reply)
+    reply = re.sub(r"(?im)^\\s*Missing Aspects\\s*:\\s*$", "Missing Aspects:", reply)
+    reply = re.sub(r"(?im)^\\s*Suggestions\\s*:\\s*$", "Suggestions:", reply)
+    reply = re.sub(r"(?im)^\\s*Conclusion\\s*:\\s*$", "Conclusion:", reply)
+
+    # Bold headings and ensure spacing
+    headings = {
+        "Student's Core Claims:": "**Student's Core Claims:**",
+        "Mistakes:": "**Mistakes:**",
+        "Missing Aspects:": "**Missing Aspects:**",
+        "Suggestions:": "**Suggestions:**",
+        "Conclusion:": "**Conclusion:**"
+    }
+    for h, bold_h in headings.items():
+        reply = re.sub(rf"(?im)^\\s*{re.escape(h)}\\s*$", bold_h + "\\n", reply)
+
+    # Reformat bullets in Core Claims section
+    m = re.search(r"(?is)(Student's Core Claims:\\s*)(.*?)(\\n(?:\\*\\*Mistakes:\\*\\*|\\*\\*Missing Aspects:\\*\\*|\\*\\*Suggestions:\\*\\*|\\*\\*Conclusion:\\*\\*|$))", reply)
+    if m:
+        head, body, tail = m.group(1), m.group(2), m.group(3)
+        lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+        fixed = []
+        for ln in lines:
+            ln = re.sub(r"^\\s*[•\\-*]\\s*", "• ", ln)
+            m1 = re.match(r"^\\s*•\\s*(Correct|Incorrect|Not supported)\\s*:?\\s*(.+)$", ln, flags=re.I)
+            m2 = re.match(r"^\\s*•\\s*\\[(Correct|Incorrect|Not supported)\\]\\s*(.+)$", ln, flags=re.I)
+            if m1:
+                tag, text = m1.group(1).capitalize(), m1.group(2).strip()
+                fixed.append(f"• {text} — [{tag}]")
+            elif m2:
+                tag, text = m2.group(1).capitalize(), m2.group(2).strip()
+                fixed.append(f"• {text} — [{tag}]")
+            else:
+                fixed.append(f"• {ln} — [Not supported]")
+        reply = reply.replace(m.group(0), head + "\n".join(fixed) + tail)
+
+    # Remove hallucinated 'Missing Aspects' (already present in student answer)
+    present = set()
+    for row in (rubric or {}).get("per_issue", []):
+        present.update({kw.lower() for kw in row.get("keywords_hit", [])})
+
+    def _find_section(text, title_regex):
+        m = re.search(rf"({title_regex}\\s*)(.*?)(\\n(?:\\*\\*Student's Core Claims:\\*\\*|\\*\\*Mistakes:\\*\\*|\\*\\*Suggestions:\\*\\*|\\*\\*Conclusion:\\*\\*|$))", text, flags=re.S | re.I)
+        return m.groups() if m else (None, None, None)
+
+    head, body, tail = _find_section(reply, r"\\*\\*Missing Aspects:\\*\\*")
+    if head:
+        bullets = [f"• {ln.strip()}" for ln in body.strip().splitlines() if ln.strip()]
+        kept = [b for b in bullets if not any(p in b.lower() for p in present)]
+        reply = reply.replace(head + body + tail, head + ("\n".join(kept) + "\n" if kept else "—\n") + tail)
+
+    # Collapse excessive blank lines
+    reply = re.sub(r"\n{3,}", "\n\n", reply).strip()
+
+    return reply
+
+# =======================
+# MODEL-CONSISTENCY GUARDRAIL (general, no question-specific logic)
+# =======================
+
+def _json_only(messages, api_key, model_name="llama-3.1-8b-instant", max_tokens=700):
+    """Calls Groq and returns JSON-parsed dict/list or None. Reuses call_groq + _try_parse_json present in your app."""
+    raw = call_groq(messages, api_key=api_key, model_name=model_name, temperature=0.0, max_tokens=max_tokens)
+    return _try_parse_json(raw)
+
+def check_reply_vs_model_for_contradictions(model_answer: str, reply: str, api_key: str, model_name: str) -> dict:
+    """
+    Structured 'consistency critic' that flags contradictions between ASSISTANT_REPLY and MODEL_ANSWER.
+    Returns: {"consistent": bool, "contradictions": [{"reply_span","model_basis","why","fix"}]}
+    """
+    if not api_key or not reply or not model_answer:
+        return {"consistent": True, "contradictions": []}
+
+    ma = truncate_block(model_answer, 3200)
+    rp = truncate_block(reply, 1800)
+
+    sys = (
+        "You are a strict checker. OUTPUT VALID JSON ONLY (no prose, no fences).\n"
+        "Task: Compare the ASSISTANT_REPLY to the AUTHORITATIVE_MODEL_ANSWER.\n"
+        "Identify statements in ASSISTANT_REPLY that contradict or materially diverge from the MODEL_ANSWER.\n"
+        "Focus on conclusions, rules, tests, thresholds, outcomes. Ignore style. If in doubt, prefer the MODEL_ANSWER."
+    )
+    user = (
+        "{"
+        "\"spec\":\"Return JSON: {\\\"consistent\\\":true|false, \\\"contradictions\\\":[{\\\"reply_span\\\":<=200c, \\\"model_basis\\\":<=200c, \\\"why\\\":<=120c, \\\"fix\\\":<=160c}]}\""
+        "}\n\n"
+        "AUTHORITATIVE_MODEL_ANSWER:\n\"\"\"\n" + ma + "\n\"\"\"\n\n"
+        "ASSISTANT_REPLY:\n\"\"\"\n" + rp + "\n\"\"\"\n"
+    )
+    parsed = _json_only(
+        [{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        api_key, model_name=model_name, max_tokens=700
+    )
+    if not parsed or not isinstance(parsed, dict):
+        return {"consistent": True, "contradictions": []}
+
+    contrad = parsed.get("contradictions") or []
+    clean = []
+    for c in contrad:
+        if not isinstance(c, dict):
+            continue
+        rs = (c.get("reply_span") or "")[:220]
+        mb = (c.get("model_basis") or "")[:220]
+        wy = (c.get("why") or "")[:140]
+        fx = (c.get("fix") or "")[:180]
+        if rs and mb:
+            clean.append({"reply_span": rs, "model_basis": mb, "why": wy, "fix": fx})
+
+    return {"consistent": not bool(clean), "contradictions": clean}
+
+def rewrite_reply_to_match_model(model_answer: str, reply: str, contradictions: list, api_key: str, model_name: str) -> str:
+    """
+    Rewrites the reply to align with the MODEL_ANSWER.
+    Preserves structure, ≤400 words, keeps existing [n] citations but does NOT invent new numbers.
+    """
+    if not api_key or not reply or not model_answer:
+        return reply
+
+    ma = truncate_block(model_answer, 3200)
+    rp = truncate_block(reply, 1800)
+
+    report = "\n".join(
+        f"{i}. reply: {c.get('reply_span','')}\n   model: {c.get('model_basis','')}\n   fix: {c.get('fix','')}"
+        for i, c in enumerate(contradictions[:8], 1)
+    )
+
+    sys = (
+        "You are a careful editor. Rewrite ASSISTANT_REPLY so it does NOT contradict the AUTHORITATIVE_MODEL_ANSWER.\n"
+        "Keep ≤400 words, preserve structure/voice, and KEEP existing numeric bracket citations [n].\n"
+        "Do NOT invent new numbers; you may delete/relocate an inappropriate [n].\n"
+        "If the student is wrong per the model, state the correct conclusion first and explain briefly."
+    )
+    user = (
+        "AUTHORITATIVE_MODEL_ANSWER:\n\"\"\"\n" + ma + "\n\"\"\"\n\n"
+        "ASSISTANT_REPLY (to correct):\n\"\"\"\n" + rp + "\n\"\"\"\n\n"
+        "INCONSISTENCIES:\n" + report + "\n\n"
+        "OUTPUT ONLY the corrected reply text (no JSON, no preface)."
+    )
+
+    fixed = call_groq(
+        [{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        api_key=api_key, model_name=model_name, temperature=0.1, max_tokens=900
+    )
+    return fixed or reply
+
+def enforce_model_consistency(reply: str, model_answer_filtered: str, api_key: str, model_name: str) -> str:
+    """
+    Detect → correct → (optionally) verify.
+    If LLM unavailable or nothing to fix, returns original reply.
+    """
+    if not reply:
+        return reply
+
+    check = check_reply_vs_model_for_contradictions(model_answer_filtered, reply, api_key, model_name)
+    if check.get("consistent", True):
+        return reply
+
+    corrected = rewrite_reply_to_match_model(
+        model_answer_filtered, reply, check.get("contradictions", []),
+        api_key, model_name
+    ) or reply
+
+    # Best-effort recheck; keep corrected either way
+    recheck = check_reply_vs_model_for_contradictions(model_answer_filtered, corrected, api_key, model_name)
+    return corrected if recheck.get("consistent", True) else corrected
 
 def summarize_rubric(student_answer: str, model_answer: str, backend, required_issues: List[Dict], weights: Dict):
     embs = embed_texts([student_answer, model_answer], backend)
@@ -562,13 +1099,16 @@ def collect_corpus(student_answer: str, extra_user_q: str, max_fetch: int = 20) 
     return fetched
 
 # ---- Manual relevance terms per question ----
-def manual_chunk_relevant(text: str, extracted_keywords: list[str]) -> bool:
-    return any(kw.lower() in text.lower() for kw in extracted_keywords)
+def manual_chunk_relevant(text: str, extracted_keywords: list[str], user_query: str = "") -> bool:
+    q_terms = [w.lower() for w in re.findall(r"[A-Za-zÄÖÜäöüß0-9\-]{3,}", user_query or "")]
+    keys = [k.lower() for k in (extracted_keywords or [])]
+    tgt = text.lower()
+    return any(k in tgt for k in (keys + q_terms))
 
-def retrieve_snippets_with_manual(student_answer, model_answer_filtered, pages, backend, extracted_keywords, top_k_pages=8, chunk_words=170):
 
-                                      
-    # ---- Load & chunk Course Booklet with page/para/case metadata
+def retrieve_snippets_with_manual(student_answer, model_answer_filtered, pages, backend,
+                                  extracted_keywords, user_query: str = "",
+                                  top_k_pages=8, chunk_words=170):
     manual_chunks, manual_metas = [], []
     try:
         manual_chunks, manual_metas = extract_manual_chunks_with_refs(
@@ -577,19 +1117,37 @@ def retrieve_snippets_with_manual(student_answer, model_answer_filtered, pages, 
         )
     except Exception as e:
         st.warning(f"Could not load course manual: {e}")
+    try:
+        _model_anchors = _anchors_from_model(model_answer_filtered)
+    except Exception as _e:
+        _model_anchors = []
 
-    # ✅ Filter manual chunks by the active question to avoid irrelevant booklet citations
+    if _model_anchors:
+        alow = [a.lower() for a in _model_anchors]
+        mc2, mm2 = [], []
+        for ch, meta in zip(manual_chunks, manual_metas):
+            txt = (ch or "").lower()
+            if any(a in txt for a in alow):
+                mc2.append(ch)
+                mm2.append(meta)
+        if mc2:  # shrink only if something kept
+            manual_chunks, manual_metas = mc2, mm2
+
+    # (keep the rest unchanged)
+
+    # ✅ Filter manual chunks using keywords + the user's query AND case numbers, if any
     selected_q = st.session_state.get("selected_question", "Question 1")
+    uq_cases = detect_case_numbers(user_query or "")
     filtered_chunks, filtered_metas = [], []
     for ch, m in zip(manual_chunks, manual_metas):
-        if manual_chunk_relevant(ch, extracted_keywords):
+        has_kw = manual_chunk_relevant(ch, extracted_keywords, user_query)
+        case_match = bool(uq_cases and set(uq_cases).intersection(set(m.get("cases") or [])))
+        if has_kw or case_match:
             filtered_chunks.append(ch)
             filtered_metas.append(m)
-
-    # If filtering removes everything (e.g., unusual terms), fall back to the original set
     if filtered_chunks:
         manual_chunks, manual_metas = filtered_chunks, filtered_metas
-
+    
     # ---- Prepare manual meta tuples with a unique key per *page* so we can group snippets by page
     manual_meta = []
     for m in manual_metas:
@@ -625,14 +1183,14 @@ def retrieve_snippets_with_manual(student_answer, model_answer_filtered, pages, 
         all_meta   = all_meta[:m]
 
     # Query vector built from student + model slice
-    query = (student_answer or "") + "\n\n" + (model_answer_filtered or "")
+    query = "\n\n".join([s for s in [user_query, student_answer, model_answer_filtered] if s])
     embs = embed_texts([query] + all_chunks, backend)
     qv, cvs = embs[0], embs[1:]
     sims = [cos_sim(qv, v) for v in cvs]
     idx = np.argsort(sims)[::-1]
 
     # ✅ Similarity floor to keep only reasonably relevant snippets
-    MIN_SIM = 0.18  # tune 0.10–0.18 if needed
+    MIN_SIM = 0.22  # tune if needed
 
     # ---- Select top snippets grouped by (manual page) or (web page index)
     per_page = {}
@@ -707,11 +1265,14 @@ def system_guardrails():
         "- Do NOT fabricate page/para/case numbers.\n"
         "- Do not cite any material that does not appear in the SOURCES list.\n\n"
         "FEEDBACK PRINCIPLES:\n"
+        "- If the student's answer substantially aligns with the MODEL ANSWER, do not mark core claims as incorrect; prefer 'Correct' and offer improvements."
         "- If the student's conclusion is incorrect, explicitly state the correct conclusion first, then explain why with citations [n].\n"
         "- If the student's answer is irrelevant to the selected question, say: 'Are you sure your answer corresponds to the question you selected?'\n"
         "- If central concepts are missing, point this out and explain why they matter.\n"
         "- Correct mis-citations succinctly (e.g., Art 3(1) PR → Art 3(3) PR; §40 WpHG → §43(1) WpHG).\n"
         "- Summarize or paraphrase concepts; do not copy long passages.\n\n"
+        "FACT-CHECKING RULE:\\n"
+        "- Do **not** mark something as 'Missing' if it appears in the PRESENT list provided in the prompt.\\n\\n"
         "STYLE:\n"
         "- Be concise, didactic, and actionable.\n"
         "- Use ≤400 words, no new sections.\n"
@@ -719,12 +1280,43 @@ def system_guardrails():
         "- Write in the same language as the student's answer when possible (if mixed, default to English)."
     )
 
-def build_feedback_prompt(student_answer: str,
-                          rubric: dict,
-                          model_answer: str,
-                          sources_block: str,
-                          excerpts_block: str) -> str:
+def _flatten_hits_misses_from_rubric(rubric: dict) -> tuple[list[str], list[str]]:
+    """
+    From the computed rubric, extract:
+    - present_keywords: every keyword we *deterministically* detected in the student's answer
+    - missing_keywords: every keyword we *did not* detect (flattened from rubric['missing'])
+    Both lists are lowercased and de-duplicated.
+    """
+    present = []
+    for row in (rubric or {}).get("per_issue", []):
+        present.extend(row.get("keywords_hit", []))
+    missing = []
+    for m in (rubric or {}).get("missing", []):
+        missing.extend(m.get("missed_keywords", []))
+
+    # Normalise / dedupe
+    norm = lambda s: re.sub(r"\s+", " ", (s or "").strip()).lower()
+    present = list(dict.fromkeys(norm(k) for k in present if k))
+    missing = list(dict.fromkeys(norm(k) for k in missing if k))
+
+    # Keep lists reasonably short for the prompt
+    return present[:30], missing[:30]
+
+def build_feedback_prompt(student_answer: str, rubric: dict, model_answer: str, sources_block: str, excerpts_block: str) -> str:
+    """
+    Prompt for LLM to generate feedback in 5 structured sections:
+    - Student's Core Claims
+    - Mistakes
+    - Missing Aspects
+    - Suggestions
+    - Conclusion
+    """
     issue_names = [row["issue"] for row in rubric.get("per_issue", [])]
+    present = [kw for row in rubric.get("per_issue", []) for kw in row.get("keywords_hit", [])]
+    missing = [kw for m in rubric.get("missing", []) for kw in m.get("missed_keywords", [])]
+
+    present_block = "• " + "\n• ".join(present) if present else "—"
+    missing_block = "• " + "\n• ".join(missing) if missing else "—"
 
     return f"""
 GRADE THE STUDENT'S ANSWER USING THE RUBRIC AND THE WEB/BOOKLET SOURCES.
@@ -736,9 +1328,7 @@ RUBRIC SUMMARY:
 - Similarity to model answer: {rubric.get('similarity_pct', 0)}%
 - Issue coverage: {rubric.get('coverage_pct', 0)}%
 - Overall score: {rubric.get('final_score', 0)}%
-
-RUBRIC ISSUES TO COVER:
-- {", ".join(issue_names) if issue_names else "—"}
+- Issues to cover: {", ".join(issue_names) if issue_names else "—"}
 
 MODEL ANSWER (AUTHORITATIVE):
 \"\"\"{model_answer}\"\"\"
@@ -749,24 +1339,117 @@ SOURCES (numbered; cite using [1], [2], … ONLY from this list):
 EXCERPTS (quote sparingly; cite using [1], [2], …):
 {excerpts_block}
 
-TASK (you MUST follow these steps):
-1) Extract the student's core CLAIMS as short bullets (no more than 3–5 bullets). For EACH claim, give it one of the labesl "Correct" / "Incorrect" / "Not supported".
-2) Where you label a student core claim as incorrect, explain briefly why.
-3) Where important aspects are missing, explain what aspects are missing, and why they are important. 
-4) Give concise IMPROVEMENT TIPS (1–3 bullets) tied to the rubric issues, ideally with a numeric citation.
-5) End with a single-sentence CONCLUSION.
+AUTO-DETECTED EVIDENCE:
+- PRESENT in student's answer (DO NOT MARK THESE AS MISSING):
+{present_block}
+
+- POTENTIALLY MISSING (only mark as missing if truly absent AND material):
+{missing_block}
+
+OUTPUT FORMAT (use EXACTLY these headings):
+
+**Student's Core Claims:**
+• <claim> — [Correct|Incorrect|Not supported]
+
+**Mistakes:**
+• <incorrect claim> — Explanation of why it is incorrect [n]
+
+**Missing Aspects:**
+• <missing concept> — Explanation of why it matters [n]
+
+**Suggestions**
+• <optional suggestion to improve clarity or depth> [n]
+
+**Conclusion:**
+<one-sentence summary>
 
 RULES:
-- Use numeric citations matching the SOURCES list (e.g., [1], [2]); never “[n]”.
-- Do not invent any Course Booklet page/para/case reference; cite only from SOURCES.
-- Be concrete; avoid tautologies (e.g., “refer to Art 7(1) instead of Art 7(1)”).
+- Do NOT mark anything as missing if it appears in the PRESENT list.
+- Use numeric citations [n] only from SOURCES.
+- Do NOT fabricate citations or Course Booklet references.
+- Be concise, didactic, and actionable.
 - ≤400 words total.
-"""
+""".strip()
+
+def lock_out_false_missing(reply: str, rubric: dict) -> str:
+    """
+    Removes any 'Missing Aspects' bullet whose text contains a keyword we already
+    detected in the student's answer (rubric['per_issue'][...]['keywords_hit']).
+    """
+    if not reply:
+        return reply
+
+    try:
+        present, _ = _flatten_hits_misses_from_rubric(rubric)
+        present_set = {p.lower() for p in present}
+
+        # Find the 'Missing Aspects:' section using the same logic as _find_section
+        head, body, tail, span = _find_section(reply, r"Missing Aspects:")
+        if not head:
+            return reply
+
+        # Turn the section body into bullets, filter out any bullet that mentions a present keyword
+        bullets = [f"• {ln.strip()}" for ln in body.strip().splitlines() if ln.strip()]
+        kept = []
+        for b in bullets:
+            low = re.sub(r"\s+", " ", b).lower()
+            if any(k in low for k in present_set):
+                # Drop bullet: it hallucinates "missing" for something we already saw
+                continue
+            kept.append(b)
+
+        new_block = "—\n" if not kept else "\n".join(kept) + "\n"
+        return reply.replace(head + body + tail, head + new_block + tail)
+    except Exception:
+        return reply
+
+
+def enforce_feedback_template(reply: str) -> str:
+    """
+    Light normaliser:
+    - Rename 'CLAIMS:' to 'Student's Core Claims:' if model drifted.
+    - Collapse duplicate 'Correct. This claim aligns...' lines.
+    - Normalise odd bullet artifacts such as 'Suggestions: • • None. •'
+    - Ensure empty sections show as '—'
+    """
+    if not reply:
+        return reply
+
+    # 1) Fix heading drift
+    reply = re.sub(r"(?im)^\s*CLAIMS\s*:\s*$", "Student's Core Claims:", reply)
+
+    # 2) Remove repeated boilerplate "Correct. This claim aligns with the MODEL ANSWER."
+    reply = re.sub(r"(?im)^\s*Correct\. This claim aligns with the MODEL ANSWER\.\s*$", "", reply)
+
+    # 3) Clean stray multiple bullets like "• • None. •"
+    reply = re.sub(r"•\s*•\s*", "• ", reply)  # collapse doubled bullets
+    reply = re.sub(r"(?im)(Suggestions:)\s*•\s*None\.?\s*(?:•\s*)*$", r"\1\n—", reply)
+
+    # 4) If a heading is present but no content, replace with '—'
+    for title in ["Missing Aspects:", "Suggestions:"]:
+        reply = re.sub(
+            rf"(?is)({re.escape(title)}\s*)(?:-+\s*|\s*)\n?(?=\n|$)",
+            r"\1—\n",
+            reply
+        )
+
+    # 5) Remove a few accidental blank lines
+    reply = re.sub(r"\n{3,}", "\n\n", reply).strip()
+    return reply
 
 def build_chat_messages(chat_history: List[Dict], model_answer: str, sources_block: str, excerpts_block: str) -> List[Dict]:
     msgs = [{"role": "system", "content": system_guardrails()}]
+
+    # --- Step 3: Hard rule to keep replies aligned with the MODEL ANSWER ---
+    msgs.append({"role": "system", "content":
+        "HARD RULE: Do not contradict the MODEL ANSWER. "
+        "If student reasoning conflicts, state the correct conclusion per the MODEL ANSWER and explain briefly."
+    })
+
     for m in chat_history[-8:]:
-        if m["role"] in ("user", "assistant"): msgs.append(m)
+        if m.get("role") in ("user", "assistant"):
+            msgs.append(m)
+
     # Pin authoritative context and sources
     msgs.append({"role": "system", "content": "MODEL ANSWER (authoritative):\n" + model_answer})
     msgs.append({"role": "system", "content": "SOURCES:\n" + sources_block})
@@ -776,23 +1459,6 @@ def build_chat_messages(chat_history: List[Dict], model_answer: str, sources_blo
 # ------------------------------ Chat and Feebdack Helpers ----------
 def web_page_relevant(text: str, extracted_keywords: list[str]) -> bool:
     return any(kw.lower() in text.lower() for kw in extracted_keywords)
-
-def parse_cited_indices(text: str) -> list[int]:
-    """Return sorted unique [n] indices used in text."""
-    try:
-        return sorted(set(int(x) for x in re.findall(r"\[(\d+)\]", text or "")))
-    except Exception:
-        return []
-
-def filter_sources_by_indices(source_lines: list[str], used: list[int]) -> list[str]:
-    """Return only those lines whose [n] was actually cited; preserve numbering."""
-    if not used:
-        return []
-    out = []
-    for n in used:
-        if 1 <= n <= len(source_lines):
-            out.append(source_lines[n - 1])
-    return out
 
 # ---- Output completeness helpers ----
 def is_incomplete_text(text: str) -> bool:
@@ -831,17 +1497,13 @@ def render_sources_used(source_lines: list[str]) -> None:
         for line in source_lines:
             st.markdown(f"- {line}")
 
-def clear_chat_draft():
-    # Clear the persistent composer safely during the button's on_click callback
-    st.session_state["chat_draft"] = ""
-
 # --- Citation post-processing & filtering ---
 def parse_cited_indices(text: str) -> list[int]:
-    """Return sorted unique [n] indices used in text."""
     try:
-        return sorted(set(int(x) for x in re.findall(r"\[(\d+)\]", text or "")))
+        return sorted({int(x) for x in re.findall(r"\[(\d+)\]", text or "")})
     except Exception:
         return []
+
 
 def filter_sources_by_indices(source_lines: list[str], used: list[int]) -> list[str]:
     """Return only those lines whose [n] was actually cited; preserve numbering."""
@@ -853,40 +1515,20 @@ def filter_sources_by_indices(source_lines: list[str], used: list[int]) -> list[
             out.append(source_lines[n - 1])
     return out
 
-# ---- Course Booklet parsing helpers (fixed) ----
-def split_into_paragraphs(text: str) -> list[str]:
-    """Split page text into paragraphs using blank lines; fall back to grouping lines."""
-    paras = [t.strip() for t in re.split(r"\n\s*\n", text) if t.strip()]
-    if paras:
-        return paras
-    # Fallback: group every ~8 lines into a paragraph
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    out, cur = [], []
-    for i, ln in enumerate(lines):
-        cur.append(ln)
-        if (i + 1) % 8 == 0:
-            out.append(" ".join(cur)); cur = []
-    if cur:
-        out.append(" ".join(cur))
-    return out
+# Paragraph markers may appear as "para. 115", "paragraph 115", "Rn. 115", "[115]", "¶ 115"
 
-# Paragraph markers actually present in the booklet:
-#  - "para. 115"/"paragraph 115"/"Rn. 115"
-#  - left-margin bold numbers extracted as **176**, ** 10 **, etc.
 _para_patterns = [
     re.compile(r"\bpara(?:graph)?\.?\s*(\d{1,4})\b", re.I),
     re.compile(r"\brn\.?\s*(\d{1,4})\b", re.I),
-    re.compile(r"\*\*\s*(\d{1,4})\s*\*"),
+    re.compile(r"\[\s*(\d{1,4})\s*\]"),
+    re.compile(r"¶\s*(\d{1,4})"),
 ]
 
-# Case markers: prefer "Case Study N", also accept "Case N"/"Fall N"
+# Case markers: must have the word "Case", "Case Study"
 _case_patterns = [
     re.compile(r"\bCase\s*Study\s*(\d{1,4})\b", re.I),
-    re.compile(r"\b(?:Case|Fall)\s*(\d{1,4})\b", re.I),
-]
-
-# Case markers: "Case 14" or "Fall 14"
-_case_pattern = re.compile(r"\b(?:Case|Fall)\s*(\d{1,4})\b", re.I)
+    re.compile(r"\bCase\s*(\d{1,4})\b", re.I),
+    ]
 
 def detect_para_numbers(text: str) -> list[int]:
     nums = []
@@ -911,18 +1553,181 @@ def detect_para_numbers(text: str) -> list[int]:
 def detect_case_numbers(text: str) -> list[int]:
     nums = []
     for pat in _case_patterns:
-        nums += pat.findall(text)
+        nums += pat.findall(text or "")
     out = []
     for x in nums:
-        if x not in out:
-            out.append(x)
-    return [int(x) for x in out]
+        n = int(x)
+        if n not in out:
+            out.append(n)
+    return out
 
+@st.cache_resource(show_spinner=False)
+
+def _median_or_default(xs, default=12.0):
+    xs = [x for x in xs if isinstance(x, (int, float))]
+    return stats.median(xs) if xs else default
+
+def _dehyphenate_join(prev: str, curr: str) -> str:
+    """
+    Join two line fragments, removing soft hyphenation like: "disclo-" + "sure" -> "disclosure".
+    Only if prev ends with '-' and curr starts with lowercase letter.
+    """
+    if prev.endswith("-") and curr and curr[:1].islower():
+        return prev[:-1] + curr
+    # otherwise join with space (avoid double spaces)
+    if prev and curr:
+        if prev.endswith((" ", "—", "–")) or curr.startswith((" ", "—", "–")):
+            return prev + curr
+        return prev + " " + curr
+    return prev or curr
+
+# ============ Deterministic booklet parsing helpers ============
+# Accepts: "12", "12.", "12)", "12 –", "12 —" etc. at the **very start** of a line.
+LEAD_NUM_RE   = re.compile(r"^\s*(\d{1,4})(?:[.)]|\s*[-–—])?\s+")
+CASE_LINE_RE = re.compile(
+    r"""^\s*
+        (?:[-•–]\s*)?               # optional bullet
+        (?:\[\**\s*)?               # optional '[' / '**' (Case Notes formatting)
+        Case\s*Study\s*(\d{1,4})\b
+    """,
+    re.I | re.VERBOSE,
+)
+
+from typing import Optional
+
+def _page_lines_with_spans(page) -> list[dict]:
+    """
+    Return ordered line dicts with geometry + spans:
+      [{'x0','y0','x1','y1','text','spans':[{'text','size','font','bbox'...}, ...]}, ...]
+    """
+    d = page.get_text("dict")
+    out = []
+    for blk in d.get("blocks", []):
+        if blk.get("type") != 0:
+            continue
+        for ln in blk.get("lines", []):
+            spans = ln.get("spans", [])
+            txt = "".join(s.get("text", "") for s in spans)
+            if not txt.strip():
+                continue
+            x0, y0, x1, y1 = ln.get("bbox", [0, 0, 0, 0])
+            out.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "text": txt, "spans": spans})
+    out.sort(key=lambda L: (L["y0"], L["x0"]))
+    return out
+
+def _median(xs, default=12.0):
+    xs = [x for x in xs if isinstance(x, (int, float))]
+    return stats.median(xs) if xs else default
+
+def _body_left_threshold(lines: list[dict]) -> float:
+    """
+    Left edge of main body column = median x0 of lines (robust even if margin numbers exist).
+    """
+    xs = [L["x0"] for L in lines]
+    if not xs:
+        return 60.0
+    # Use 40th percentile as a robust body-left estimate (ignores a few very-left gutter lines)
+    xs_sorted = sorted(xs)
+    idx = max(0, min(len(xs_sorted)-1, int(0.40 * len(xs_sorted))))
+    return xs_sorted[idx]
+
+def _dehyphen_join(prev: str, curr: str) -> str:
+    if not prev:
+        return curr
+    if prev.endswith("-") and curr and curr[:1].islower():
+        return prev[:-1] + curr
+    # normal join with single space
+    return (prev + " " + curr).strip()
+
+def _match_leading_number(line_text: str) -> Optional[int]:
+    m = LEAD_NUM_RE.match(line_text)
+    if not m:
+        return None
+    try:
+        n = int(m.group(1))
+        return n
+    except Exception:
+        return None
+
+def _strip_leading_number(line_text: str) -> str:
+    """
+    Remove the leading '12', '12.', '12)', '12 –', etc., and return the remaining text.
+    Ensures we do **not** lose the first line of the paragraph.
+    """
+    return LEAD_NUM_RE.sub("", line_text, count=1).strip()
+
+def _find_case_starts(lines: list[dict], body_left: float) -> list[dict]:
+    """
+    Return [{'case':N,'y0':<line top>}, ...] for lines starting with 'Case Study N ...'
+    that appear **in the body column** (not the left number gutter).
+    """
+    hits = []
+    for L in lines:
+        # keep only lines that begin near/at the body column
+        if L["x0"] < body_left - 3.0:
+            continue
+        m = CASE_LINE_RE.match(L["text"])
+        if m:
+            hits.append({"case": int(m.group(1)), "y0": L["y0"]})
+    hits.sort(key=lambda d: d["y0"])
+    return hits
+
+def _extract_page_paragraphs(page) -> tuple[list[dict], list[dict]]:
+    """
+    Parse a page into anchored paragraphs and case-start markers.
+
+    Returns:
+      para_items: [{'para':N, 'y0':float, 'text':str}]
+      case_starts: [{'case':K, 'y0':float}]
+    """
+    lines = _page_lines_with_spans(page)
+    if not lines:
+        return [], []
+
+    body_left = _body_left_threshold(lines)
+
+    para_items: list[dict] = []
+    case_starts = _find_case_starts(lines, body_left)
+
+    cur_para_num = None
+    cur_para_y0  = None
+    cur_text     = ""
+
+    for L in lines:
+        txt = L["text"].strip()
+
+        # New paragraph if this line starts with a leading number
+        n = _match_leading_number(txt)
+        if n is not None:
+            # flush previous paragraph
+            if cur_para_num is not None and cur_text.strip():
+                para_items.append({"para": cur_para_num, "y0": cur_para_y0, "text": cur_text.strip()})
+            # start new paragraph; keep the **rest of this line** (first-line text!)
+            cur_para_num = n
+            cur_para_y0  = L["y0"]
+            cur_text     = _strip_leading_number(txt)
+        else:
+            # continuation line for current paragraph
+            if cur_para_num is not None:
+                cur_text = _dehyphen_join(cur_text, txt)
+            else:
+                # lines before the first numbered paragraph on the page: ignore for numbered parsing
+                pass
+
+    # flush trailing paragraph
+    if cur_para_num is not None and cur_text.strip():
+        para_items.append({"para": cur_para_num, "y0": cur_para_y0, "text": cur_text.strip()})
+
+    return para_items, case_starts
+# ============ /Deterministic booklet parsing helpers ============
 def extract_manual_chunks_with_refs(pdf_path: str, chunk_words_hint: int = 170) -> tuple[list[str], list[dict]]:
     """
-    Returns (chunks, metas) with accurate page *labels* (printed page numbers),
-    not just 1-based PDF indices. We split by paragraphs and break very long ones by sentences.
-    meta: {pdf_index, page_label, page_num, paras [ints], cases [ints], file}
+    Deterministic extraction:
+      • Each chunk corresponds to one numbered paragraph (paras=[N]).
+      • 'case_section' stores the enclosing "Case Study K" based on the nearest
+        preceding 'Case Study K ...' line (persists across pages).
+      • Very long paragraphs are split by sentences near 'chunk_words_hint' while
+        keeping the same anchors.
     """
     chunks, metas = [], []
     try:
@@ -930,91 +1735,129 @@ def extract_manual_chunks_with_refs(pdf_path: str, chunk_words_hint: int = 170) 
     except Exception:
         return [], []
 
+    current_case_section: Optional[int] = None  # carried across pages
+
     for pno in range(len(doc)):
         page = doc.load_page(pno)
-        page_text = page.get_text("text")
-        # Remove repeating headers like "Version 11 June 2025" and stray page numbers
-        page_text = clean_page_text(page_text)
         page_label = page.get_label() or str(pno + 1)
-        paras = split_into_paragraphs(page_text)
-        
-        for para in paras:
-            # Break very long paragraphs roughly to the hint size
-            words = para.split()
+
+        para_items, case_starts = _extract_page_paragraphs(page)
+        # --- NEW: build explicit case-chunks (prompts / case notes) on this page ---
+        # We slice from each "Case Study N" line to the next "Case Study ..." line.
+        lines = _page_lines_with_spans(page)
+        body_left = _body_left_threshold(lines)
+
+        # Collect segments for each case start detected on this page
+        for k, cs in enumerate(sorted(case_starts, key=lambda d: d["y0"])):
+            y0 = cs["y0"]
+            y1 = case_starts[k + 1]["y0"] if k + 1 < len(case_starts) else float("inf")
+
+            seg_lines = []
+            for L in lines:
+                # Keep only body-column text between y0..y1 (ignore left-gutter numbers)
+                if L["y0"] >= y0 - 0.2 and L["y0"] < y1 - 0.2 and L["x0"] >= body_left - 3.0:
+                    t = (L.get("text") or "").strip()
+                    if t:
+                        seg_lines.append(t)
+
+            seg_text = _normalize_ws(" ".join(seg_lines))
+            # Basic sanity: keep only if it begins with "Case Study N" and has some tail text
+            if not seg_text or not re.match(r"^\s*Case\s*Study\s*{}\b".format(cs["case"]), seg_text, flags=re.I):
+                continue
+
+            chunks.append(seg_text)
+            metas.append({
+                "pdf_index": pno,
+                "page_label": page_label,
+                "page_num": pno + 1,
+                "paras": [],                  # <-- no paragraph number for case chunks
+                "cases": [cs["case"]],        # <-- cite as “Case Study N”
+                "case_section": cs["case"],   # keep the enclosing section too
+                "file": "EUCapML - Course Booklet.pdf",
+                "kind": "case",               # optional tag (may help future filtering)
+            })
+        # walk down the page; whenever a case start appears above the paragraph, update section
+        case_idx = 0
+        case_starts = sorted(case_starts, key=lambda d: d["y0"])
+
+        for it in sorted(para_items, key=lambda d: d["y0"]):
+            # advance case section
+            while case_idx < len(case_starts) and case_starts[case_idx]["y0"] <= it["y0"] + 0.5:
+                current_case_section = case_starts[case_idx]["case"]
+                case_idx += 1
+
+            para_no = it["para"]
+            text    = it["text"]
+
+            # split long paragraphs (keep anchors)
+            parts = [text]
+            words = text.split()
             if len(words) > chunk_words_hint * 2:
-                parts = re.split(r"(?<=[\.\?\!…])\s+", para)
-                cur, cur_words = [], 0
-                for s in parts:
-                    cur.append(s)
-                    cur_words += len(s.split())
-                    if cur_words >= chunk_words_hint:
-                        para_part = " ".join(cur).strip()
-                        chunks.append(para_part)
-                        metas.append({
-                            "pdf_index": pno,
-                            "page_label": page_label,
-                            "page_num": pno + 1,  # numeric fallback for anchors
-                            "paras": detect_para_numbers(para_part) or detect_para_numbers(para),
-                            "cases": detect_case_numbers(para_part) or detect_case_numbers(para),
-                            "file": "EUCapML - Course Booklet.pdf",  # <-- unify name with actual path
-                        })
-                        cur, cur_words = [], 0
+                bits = re.split(r"(?<=[\.\?\!…])\s+", text)
+                cur, acc, parts = [], 0, []
+                for s in bits:
+                    cur.append(s); acc += len(s.split())
+                    if acc >= chunk_words_hint:
+                        parts.append(" ".join(cur).strip()); cur, acc = [], 0
                 if cur:
-                    para_part = " ".join(cur).strip()
-                    chunks.append(para_part)
-                    metas.append({
-                        "pdf_index": pno,
-                        "page_label": page_label,
-                        "page_num": pno + 1,
-                        "paras": detect_para_numbers(para_part) or detect_para_numbers(para),
-                        "cases": detect_case_numbers(para_part) or detect_case_numbers(para),
-                        "file": "EUCapML - Course Booklet.pdf",
-                    })
-            else:
-                chunks.append(para)
+                    parts.append(" ".join(cur).strip())
+
+            for part in parts:
+                if not part:
+                    continue
+                chunks.append(part)
                 metas.append({
                     "pdf_index": pno,
                     "page_label": page_label,
                     "page_num": pno + 1,
-                    "paras": detect_para_numbers(para),
-                    "cases": detect_case_numbers(para),
+                    "paras": [para_no],          # <- primary anchor
+                    "cases": [],                 # <- not used for paragraph chunks
+                    "case_section": current_case_section,  # <- enclosing Case Study (may be None)
                     "file": "EUCapML - Course Booklet.pdf",
                 })
+
     doc.close()
     return chunks, metas
 
 def format_manual_citation(meta: dict) -> str:
     """
-    Manual citation for the Sources list:
-    'Course Booklet — Case Study 14, para. 115'
-    or (if only one is detected): 'Course Booklet — para. 115'  / 'Course Booklet — Case Study 14'
-    Falls back to 'Course Booklet — (no paragraph number detected)' if nothing is found.
+    Build a clean, human-readable citation line for the Course Booklet.
+
+    Rules:
+    - Always print page info first: "page <label> (PDF <n>)"
+    - If this chunk belongs to a Case Study, add "Case Study N" even for
+      non-headline paragraphs (via case_section fallback).
+    - If no case applies, but we have a paragraph number, append "para. N".
     """
-    paras = meta.get("paras") or []
-    cases = meta.get("cases") or []
+    paras      = meta.get("paras") or []
+    cases      = meta.get("cases") or []
+    case_sec   = meta.get("case_section")  # enclosing Case Study (int) or None
+    page_label = meta.get("page_label") or ""
+    pdf_p      = meta.get("page_num")
 
-    # Normalize, keep at most a short range for readability
-    xs = sorted({int(p) for p in paras if isinstance(p, (int, str)) and str(p).isdigit()})
-    if len(xs) >= 2 and xs[1] == xs[0] + 1:
-        para_anchor = f"paras {xs[0]}–{xs[1]}"
-    elif xs:
-        para_anchor = f"para. {xs[0]}"
-    else:
-        para_anchor = ""
-
-    parts = ["Course Booklet"]
     anchors = []
-    if cases:
-        anchors.append(f"Case Study {cases[0]}")
-    if para_anchor:
-        anchors.append(para_anchor)
 
-    if anchors:
-        parts.append(" — " + ", ".join(anchors))
+    # Page anchor
+    if page_label or pdf_p:
+        if page_label and pdf_p:
+            anchors.append(f"page {page_label} (PDF {pdf_p})")
+        elif page_label:
+            anchors.append(f"page {page_label}")
+        else:
+            anchors.append(f"PDF {pdf_p}")
     else:
-        parts.append(" — (no paragraph number detected)")
+        anchors.append("PDF page ?")
 
-    return "".join(parts)
+    # Case anchor: prefer explicit case on the chunk, else enclosing section
+    case_n = cases[0] if cases else (case_sec if isinstance(case_sec, int) else None)
+    if case_n:
+        anchors.append(f"Case Study {case_n}")
+
+    # Paragraph anchor only if we don't already have a Case Study tag
+    if paras and not case_n:
+        anchors.append(f"para. {paras[0]}")
+
+    return "Course Booklet — " + ", ".join(anchors)
 
 # ---- Simple page cleaner for booklet parsing ----
 def clean_page_text(t: str) -> str:
@@ -1104,7 +1947,7 @@ if not st.session_state.authenticated:
         st.session_state.authenticated = True
         st.success("PIN accepted. By clicking CONTINUE below you accept that this tool uses artificial intelligence and large language models, and that accordingly, answers may not be accurate. No liability is accepted for use of this tool.")
         if st.button("Continue"):
-            st.experimental_rerun()
+            st.rerun()
     elif pin_input:
         st.error("Incorrect PIN. Please try again.")
     st.stop()
@@ -1145,23 +1988,7 @@ with st.sidebar:
             st.code((r.text or "")[:1000], language="json")
         except Exception as e:
             st.exception(e)
-    
-    # ---- Course Booklet diagnostics ----
-    st.subheader("Course Booklet diagnostics")
-    if st.checkbox("Preview parsed booklet (first 6 pages)"):
-        try:
-            chunks, metas = extract_manual_chunks_with_refs("assets/EUCapML - Course Booklet.pdf", chunk_words_hint=160)
-            by_page = {}
-            for ch, m in zip(chunks, metas):
-                by_page.setdefault(m["page_label"], []).append((ch[:140] + ("…" if len(ch) > 140 else ""), m))
-            for i, (lbl, arr) in enumerate(list(by_page.items())[:6], start=1):
-                st.markdown(f"**Page label {lbl}** (PDF p. {arr[0][1]['page_num']})")
-                for snip, meta in arr[:2]:  # show 2 snippets per page
-                    st.write("•", snip)
-                    st.caption(f"Cases: {meta['cases'] or '—'} | Paras: {meta['paras'] or '—'}")
-        except Exception as e:
-            st.warning(f"Preview failed: {e}")
-            
+        
 # Main UI
 st.image("assets/logo.png", width=240)
 st.title("EUCapML Case Tutor")
@@ -1200,11 +2027,17 @@ with colA:
                     api_key,
                     DEFAULT_WEIGHTS
                 )
-                                
+
+                agreement = in_agreement_mode(rubric)
+                prelude = agreement_prompt_prelude(agreement)
+                
                 top_pages, source_lines = [], []
                 if enable_web:
                     pages = collect_corpus(student_answer, "", max_fetch=22)
-                    top_pages, source_lines = retrieve_snippets_with_manual(student_answer, model_answer_filtered, pages, backend, extracted_keywords, top_k_pages=max_sources, chunk_words=170)
+                    top_pages, source_lines = retrieve_snippets_with_manual(
+                        student_answer, model_answer_filtered, pages, backend, extracted_keywords,
+                        user_query="", top_k_pages=max_sources, chunk_words=170
+                    )
                     
             # Breakdown
             with st.expander("🔬 Issue-by-issue breakdown"):
@@ -1227,34 +2060,57 @@ with colA:
                 for sn in tp["snippets"]:
                     excerpts_items.append(f"[{i+1}] {sn}")
             excerpts_block = "\n\n".join(excerpts_items[: max_sources * 3]) if excerpts_items else "(no excerpts)"
-
+            
+            # --- Narrative Feedback (fixed) ---
             st.markdown("### 🧭 Narrative Feedback")
             if api_key:
                 # Trim large blocks *before* building the prompt
                 sources_block = truncate_block(sources_block, 1200)
                 excerpts_block = truncate_block(excerpts_block, 3200)
             
+                # Hard rule included here with correct quoting (no stray backslash)
+                hard_rule = (
+                    "HARD RULE: Do not contradict the MODEL ANSWER. "
+                    "If student reasoning conflicts, state the correct conclusion per the MODEL ANSWER and explain briefly.\n\n"
+                )
+            
                 messages = [
                     {"role": "system", "content": system_guardrails()},
-                    {"role": "user", "content": build_feedback_prompt(student_answer, rubric, model_answer_filtered, sources_block, excerpts_block)},
+                    {"role": "user", "content": prelude + hard_rule + build_feedback_prompt(
+                        student_answer, rubric, model_answer_filtered, sources_block, excerpts_block
+                    )},
                 ]
             
-                reply = generate_with_continuation(messages, api_key, model_name=model_name, temperature=temp,
-                                   first_tokens=1200, continue_tokens=350)
-
+                reply = generate_with_continuation(
+                    messages, api_key, model_name=model_name, temperature=temp,
+                    first_tokens=1200, continue_tokens=350
+                )
+                reply = enforce_model_consistency(
+                    reply,
+                    model_answer_filtered,
+                    api_key,
+                    model_name,
+                )
+                reply = merge_to_suggestions(reply, student_answer, activate=agreement)
+                reply = tidy_empty_sections(reply)
+                reply = prune_redundant_improvements(student_answer, reply)
+                reply = lock_out_false_missing(reply, rubric)
+                reply = enforce_feedback_template(reply)
+                reply = format_feedback_and_filter_missing(reply, student_answer, model_answer_filtered, rubric)
+                reply = bold_section_headings(reply)
+                reply = re.sub(r"\[(?:n|N)\]", "", reply or "")
+            
+                used_idxs = parse_cited_indices(reply)
+                display_source_lines = filter_sources_by_indices(source_lines, used_idxs) or source_lines
+            
                 if reply:
-                    # Safety net: strip any stray “[n]” placeholders
-                    reply = re.sub(r"\[(?:n|N)\]", "", reply or "")
-                    st.write(reply)
-
-                    # Show only the sources actually cited in the narrative:
-                    used_idxs = parse_cited_indices(reply)
-                    display_source_lines = filter_sources_by_indices(source_lines, used_idxs) or source_lines
+                    st.markdown(reply)
                 else:
                     st.info("LLM unavailable. See corrections above and the issue breakdown.")
             else:
                 st.info("No GROQ_API_KEY found in secrets/env. Deterministic scoring and corrections shown above.")
-
+                display_source_lines = source_lines
+            
             if source_lines:
                 with st.expander("📚 Sources used"):
                     for line in display_source_lines:
@@ -1262,8 +2118,7 @@ with colA:
 
 with colB:
     st.markdown("### 💬 Tutor Chat: Ask me anything!")
-    st.caption("You can use this chat to ask for help with creating an answer, follow-up questions on feedback given by this app, and discuss cases from the course booklet.")
-
+    
     # --- state ---
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
@@ -1274,7 +2129,7 @@ with colB:
     c1, c2, c3, c4 = st.columns([6, 1, 1, 2])
     with c1:
         st.text_area(
-            "Ask a question about your feedback, the law, or how to improve…",
+            "You can use this chat to ask for help with creating an answer, follow-up questions on feedback given by this app, etc.",
             key="chat_draft",
             height=90
         )
@@ -1304,7 +2159,7 @@ with colB:
                 pages = collect_corpus(student_answer, user_q, max_fetch=20)
                 top_pages, source_lines = retrieve_snippets_with_manual(
                     student_answer, model_answer_filtered, pages, backend, extracted_keywords,
-                    top_k_pages=max_sources, chunk_words=170
+                    user_query=user_q, top_k_pages=max_sources, chunk_words=170
                 )
                                             
             sources_block = "\n".join(source_lines) if source_lines else "(no web sources available)"
@@ -1329,6 +2184,24 @@ with colB:
                     msgs, api_key, model_name=model_name, temperature=temp,
                     first_tokens=1200, continue_tokens=350
                 )
+                
+                reply = enforce_model_consistency(
+                    reply,
+                    model_answer_filtered,
+                    api_key,
+                    model_name,    
+                )
+
+                msgs.append({"role": "system", "content":
+                    "When the student's view aligns with the MODEL ANSWER, avoid marking claims as incorrect; "
+                    "present extra provisions and edge cases under a short 'Suggestions' or 'Further Considerations' section."
+                })
+                
+                # cleanup + source filtering remain unchanged
+                reply = re.sub(r"\[(?:n|N)\]", "", reply or "")
+                used_idxs = parse_cited_indices(reply)
+                msg_sources = filter_sources_by_indices(source_lines, used_idxs) or source_lines[:]
+            
             else:
                 reply = None
             if not reply:
@@ -1369,6 +2242,6 @@ with colB:
 
 st.divider()
 st.markdown(
-    "ℹ️ **Notes**: This app is authored by Stephan Balthasar. It provides feedback based on artificial intelligence and large language models, and as a result, answers can be inaccurate." 
+    "ℹ️ **Notes**: This app is authored by Stephan Balthasar. It provides feedback based on artificial intelligence and large language models, and as a result, answers can be inaccurate. " 
     "Students are advised to use caution when using the feedback engine and chat functions."
 )
