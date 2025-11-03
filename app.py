@@ -16,14 +16,413 @@ import streamlit as st
 import statistics as stats
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
-
 import requests
 from bs4 import BeautifulSoup
+BOOKLET = "assets/EUCapML - Course Booklet.docx"
 
 # ---------------- Build fingerprint (to verify latest deployment) ----------------
 APP_HASH = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:10]
 
+# --------------------------- WORD-ONLY PARSER + CITATIONS ---------------------------
+import re
+from typing import List, Dict, Any, Tuple, Union, IO
+from docx import Document
+
+# --- Compact citation formatter (no PDF assumptions) ---
+def format_manual_citation(meta: Dict[str, Any]) -> str:
+    """
+    Produces labels like:
+      - "see Course Booklet para. 27"
+      - "see Course Booklet Case Study 30"
+      - "see Course Booklet" (fallback)
+    """
+    paras = meta.get("paras") or []
+    cases = meta.get("cases") or []
+    case_sec = meta.get("case_section")
+    case_n = cases[0] if cases else (case_sec if isinstance(case_sec, int) else None)
+    if case_n:
+        return f"see Course Booklet Case Study {case_n}"
+    if paras:
+        return f"see Course Booklet para. {paras[0]}"
+    return "see Course Booklet"
+
+# --- Word-based parser: extracts numbered paragraphs and case sections ---
+import re
+from typing import List, Dict, Any, Tuple, Union, IO
+from docx import Document
+from docx.text.paragraph import Paragraph
+from docx.table import Table, _Cell
+from docx.oxml.text.paragraph import CT_P
+from docx.oxml.table import CT_Tbl
+from docx.document import Document as _Document
+
+PARA_RE_DOTSAFE = re.compile(r"^(\d{1,4})\b(?!\.)")              # 12 but not 1.1
+CASE_RE = re.compile(r"^Case\s*Study\s*(\d{1,4})\b", re.I)
+
+def _iter_block_items(parent):
+    """
+    Yield each paragraph or table within *parent* in document order.
+    Works for the main document and for table cells (nested content).
+    """
+    if isinstance(parent, _Document):
+        parent_elm = parent.element.body
+    elif isinstance(parent, _Cell):
+        parent_elm = parent._tc
+    else:
+        raise ValueError("Unsupported container for block iteration")
+
+    for child in parent_elm.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            yield Table(child, parent)
+
+def _style_is_heading(p: Paragraph) -> bool:
+    try:
+        name = (p.style.name or "").lower()
+        return ("heading" in name) or ("überschrift" in name)  # German UI
+    except Exception:
+        return False
+
+def _paragraph_is_para_anchor_by_style(p: Paragraph) -> bool:
+    """
+    Detect 'numbered paragraph' anchors that are rendered via a paragraph style
+    (e.g., 'Standard with Para Numbering') rather than a visible digit.
+    We match loosely to be resilient against localized style names.
+    """
+    try:
+        name = (p.style.name or "").lower()
+        # English: "para", "number"; German Word UIs often show English custom style names too.
+        return ("para" in name and "number" in name)
+    except Exception:
+        return False
+
+def _first_nonempty_run(p: Paragraph):
+    for r in p.runs:
+        t = (r.text or "").strip()
+        if t:
+            return r, t
+    return None, ""
+
+def _run_is_bold(r) -> bool:
+    # direct bold or bold by character style; run.bold may be True/False/None
+    try:
+        return bool(r.bold) or (getattr(getattr(r, "font", None), "bold", False) is True)
+    except Exception:
+        return False
+
+def _paragraph_anchor_number(p: Paragraph) -> int | None:
+    """
+    Anchor if the first non-empty run is BOLD and consists only of digits (1–4).
+    Ignore headings and list-like '1.' forms.
+    """
+    if _style_is_heading(p):
+        return None
+    r, txt = _first_nonempty_run(p)
+    if not txt or not r:
+        return None
+    # Allow surrounding whitespace but require pure digits; avoid "1." etc.
+    m = re.fullmatch(r"\s*(\d{1,4})\s*", txt)
+    if m and _run_is_bold(r):
+        return int(m.group(1))
+    # Fallback: a plain-text line starting with digits not followed by '.' and not a heading
+    m2 = PARA_RE_DOTSAFE.match((p.text or "").strip())
+    if m2 and _run_is_bold(r):
+        return int(m2.group(1))
+    return None
+
+def _cell_text(cell: _Cell) -> str:
+    # Join all paragraphs; preserve spaces
+    parts = []
+    for para in cell.paragraphs:
+        t = (para.text or "").strip()
+        if t:
+            parts.append(t)
+    return " ".join(parts).strip()
+
+def _table_row_anchor_number(row) -> int | None:
+    """
+    Detect a left-cell bold integer (1–4 digits) used as the paragraph marker.
+    """
+    if not row.cells:
+        return None
+    left = row.cells[0]
+    if not left.paragraphs:
+        return None
+    p0 = left.paragraphs[0]
+    r, txt = _first_nonempty_run(p0)
+    if not txt:
+        # also allow left cell text like "  12  " without explicit runs
+        txt = (p0.text or "").strip()
+    m = re.fullmatch(r"\s*(\d{1,4})\s*", txt)
+    if m and (r is None or _run_is_bold(r)):  # if there is a run, require bold
+        return int(m.group(1))
+    return None
+
+def _row_is_empty(row) -> bool:
+    return all(not _cell_text(c) for c in row.cells)
+
+def _flush(current: Dict[str, Any], buf: List[str],
+           out_chunks: List[str], out_metas: List[Dict[str, Any]]) -> None:
+    if not current or not buf:
+        return
+    text = re.sub(r"\s+", " ", " ".join(buf)).strip()
+    if not text:
+        return
+    meta = {
+        "paras": current.get("paras", []),
+        "cases": current.get("cases", []),
+        "case_section": current.get("case_section"),
+    }
+    # running index for downstream grouping/sorting
+    meta["page_num"] = len(out_metas) + 1
+    if meta["cases"]:
+        k = meta["cases"][0]
+        meta["title"] = f"see Course Booklet Case Study {k}"
+        meta["url"]   = f"manual+docx://case/{k}"
+    elif meta["paras"]:
+        n = meta["paras"][0]
+        meta["title"] = f"see Course Booklet para. {n}"
+        meta["url"]   = f"manual+docx://para/{n}"
+    else:
+        meta["title"] = "see Course Booklet"
+        meta["url"]   = "manual+docx://booklet"
+    out_chunks.append(text)
+    out_metas.append(meta)
+
+def parse_booklet_docx(docx_source: Union[str, IO[bytes]]
+                       ) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """
+    Parse the Course Booklet .docx into (chunks, metas) with robust detection:
+      • Case Study sections: lines starting with "Case Study <N>"
+      • Paragraph anchors: (a) paragraph style-based numbering (e.g., "Standard with Para Numbering"),
+                           (b) visible bold integer at line-start,
+                           (c) left table-cell integer
+      • Continuation: collect subsequent lines until next anchor or next Case Study
+      • Headings are not treated as paragraph numbers
+    """
+    doc = Document(docx_source)
+
+    chunks: List[str] = []
+    metas: List[Dict[str, Any]] = []
+    current: Dict[str, Any] = {}
+    buf: List[str] = []
+    current_case: int | None = None
+
+    # Running paragraph id to assign for style-based numbering when no explicit digits are present.
+    next_para_id: int = 0
+
+    def start_case(k: int, heading_text: str = ""):
+        nonlocal current, buf, current_case
+        _flush(current, buf, chunks, metas)
+        current = {"cases": [k], "paras": [], "case_section": k}
+        buf = [heading_text.strip()] if heading_text.strip() else []
+        current_case = k
+
+    def start_para(n: int, first_line: str):
+        nonlocal current, buf
+        _flush(current, buf, chunks, metas)
+        current = {"paras": [n], "cases": [], "case_section": current_case}
+        buf = [first_line.strip()] if first_line.strip() else []
+
+    # Iterate paragraphs and tables in document order
+    for block in _iter_block_items(doc):
+
+        # ----------------- Plain paragraphs -----------------
+        if isinstance(block, Paragraph):
+            t = (block.text or "").strip()
+            if not t:
+                continue
+
+            # Case Study heading outside tables
+            m_case = CASE_RE.match(t)
+            if m_case:
+                start_case(int(m_case.group(1)), t)
+                continue
+
+            # (A) Style-based paragraph anchor ("Standard with Para Numbering", etc.)
+            if _paragraph_is_para_anchor_by_style(block) and not _style_is_heading(block):
+                # Prefer explicit visible integer if present; otherwise assign the next sequential id.
+                explicit_n = _paragraph_anchor_number(block)
+                if explicit_n is not None:
+                    para_id = explicit_n
+                    if explicit_n > next_para_id:
+                        next_para_id = explicit_n
+                else:
+                    next_para_id += 1
+                    para_id = next_para_id
+
+                start_para(para_id, t)
+                continue
+
+            # (B) Visible bold integer at the start (your existing detection)
+            n = _paragraph_anchor_number(block)
+            if n is not None:
+                # If first run is just the number, drop it from the line
+                r, _txt = _first_nonempty_run(block)
+                rest = t
+                if r and re.fullmatch(r"\s*\d{1,4}\s*", r.text or ""):
+                    rest = (t[len(r.text):] or "").strip() or t
+
+                if n > next_para_id:
+                    next_para_id = n
+                start_para(n, rest or t)
+                continue
+
+            # Otherwise, continuation of current chunk
+            if current:
+                buf.append(t)
+            continue
+
+        # ----------------- Tables -----------------
+        if isinstance(block, Table):
+            for row in block.rows:
+                if _row_is_empty(row):
+                    continue
+
+                left_txt  = _cell_text(row.cells[0]) if len(row.cells) > 0 else ""
+                right_txt = _cell_text(row.cells[1]) if len(row.cells) > 1 else ""
+
+                # Case Study heading in a table cell?
+                m_case = CASE_RE.match(left_txt) or CASE_RE.match(right_txt)
+                if m_case:
+                    start_case(int(m_case.group(1)), left_txt or right_txt)
+                    continue
+                # (A) Style-based para anchor inside any cell of the row
+                style_anchor_in_row = False
+                if row.cells:
+                    for c in row.cells:
+                        for p in c.paragraphs:
+                            if _paragraph_is_para_anchor_by_style(p) and not _style_is_heading(p):
+                                style_anchor_in_row = True
+                                break
+                        if style_anchor_in_row:
+                            break
+                if style_anchor_in_row:
+                    next_para_id += 1
+                    first_line = (right_txt or left_txt).strip()
+                    start_para(next_para_id, first_line)
+                    continue
+
+                # (B) Numeric anchor in left cell (your existing table detection)
+                n = _table_row_anchor_number(row)
+                if n is not None:
+                    first_line = right_txt.strip()
+                    if not first_line:
+                        # remove leading digits from left cell if that's all we have
+                        first_line = re.sub(r"^\s*\d{1,4}\s*", "", left_txt).strip()
+                    if n > next_para_id:
+                        next_para_id = n
+                    start_para(n, first_line)
+                    continue
+
+                # Otherwise treat this row as continuation
+                cont = " ".join([x for x in [right_txt, left_txt] if x]).strip()
+                if cont and current:
+                    buf.append(cont)
+
+    _flush(current, buf, chunks, metas)
+    return chunks, metas
+
+# --- Compatibility shim for existing code that expects extract_manual_chunks_with_refs(...) ---
+def extract_manual_chunks_with_refs(docx_source: Union[str, IO[bytes]],
+                                    chunk_words_hint: int | None = None
+                                   ) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """
+    Backward-compatible signature. Ignores chunk_words_hint (we already have clean anchors).
+    """
+    return parse_booklet_docx(docx_source)
+
+# --- Cached loader for parsed anchors (Word) ---
+import math
+from typing import Union, IO, Any, List, Dict, Tuple
+
+@st.cache_data(show_spinner=False)
+def load_booklet_anchors(docx_source: Union[str, IO[bytes]]) -> Tuple[List[Dict[str, Any]], List[str], List[Dict[str, Any]]]:
+    """
+    Returns:
+      records: [{'idx', 'kind', 'id', 'preview'}] where kind ∈ {'para','case','other'}
+      chunks:  raw text chunks (same order)
+      metas:   per-chunk metadata (same order)
+    """
+    chunks, metas = extract_manual_chunks_with_refs(docx_source, chunk_words_hint=None)
+
+    def first_words(text: str, n=10) -> str:
+        toks = (text or "").split()
+        return " ".join(toks[:n])
+
+    records: List[Dict[str, Any]] = []
+    for idx, (txt, meta) in enumerate(zip(chunks, metas), start=1):
+        if meta.get("paras"):
+            kind, ident = "para", meta["paras"][0]
+        elif meta.get("cases"):
+            kind, ident = "case", meta["cases"][0]
+        else:
+            kind, ident = "other", None
+        records.append({
+            "idx": idx,
+            "kind": kind,
+            "id": ident,
+            "preview": first_words(txt, 10)
+        })
+    return records, chunks, metas
+
+## ---------------------------------------------------------------------------------------------
+
 # ---------- Public helpers you will call from the app ----------
+def add_good_catch_for_optionals(reply: str, rubric: dict) -> str:
+    import re
+    bonus = rubric.get("bonus") or []
+    if not reply or not bonus:
+        return reply
+
+    bullets = []
+    for b in bonus[:3]:  # keep it tight
+        name = b.get("issue") or "Additional point"
+        bullets.append(f"• Good catch: {name} — correct, but optional for this question.")
+
+    # Accept **Suggestions** with or without colon; normalise to with-colon
+    suggestions_hdr = re.compile(r"(?im)^\s*\*\*Suggestions\*\*:?\s*$")
+    if suggestions_hdr.search(reply):
+        reply = suggestions_hdr.sub("**Suggestions**:\n" + "\n".join(bullets) + "\n", reply, count=1)
+    else:
+        reply = reply.rstrip() + "\n\n**Suggestions**:\n" + "\n".join(bullets) + "\n"
+    return reply
+
+def derive_primary_scope(model_answer_slice: str, top_k: int = 2) -> set[str]:
+    """
+    Infer the dominant legal regime(s) for the selected question from its model-answer slice.
+    Uses boundary-aware counts and penalizes regimes that are explicitly marked
+    "not expected / not required / outside scope". Generic and scalable.
+    """
+    import re
+    text = (model_answer_slice or "")
+
+    # Boundary-aware patterns; include common aliases. Extendable over time.
+    acts = {
+        "mar":      r"\bMAR\b|\bMarket Abuse Regulation\b",
+        "pr":       r"\bPR\b|\bProspectus Regulation\b|\bRegulation\s*\(EU\)\s*2017/1129\b",
+        "mifid ii": r"\bMiFID\s*II\b|\bDirective\s*2014/65/EU\b",
+        "mifir":    r"\bMiFIR\b|\bRegulation\s*600/2014\b",
+        "td":       r"\bTD\b|\bTransparency Directive\b|\bDirective\s*2004/109/EC\b",
+        "wphg":     r"\bWpHG\b",
+        "wpüg":     r"\bWp[üu]G\b",
+    }
+
+    def count_hits(pattern: str) -> int:
+        return len(re.findall(pattern, text, flags=re.I))
+
+    counts = {k: count_hits(pat) for k, pat in acts.items()}
+
+    # Strongly downrank regimes flagged as out-of-scope in the slice itself.
+    for k, pat in acts.items():
+        penalty_pat = rf"(?:not\s+expected|not\s+required|outside(?:\s+the)?\s+scope).{{0,60}}(?:{pat})"
+        if re.search(penalty_pat, text, flags=re.I):
+            counts[k] = max(0, counts[k] - 100)
+
+    top = [k for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])) if v > 0][:top_k]
+    return set(top)
+
 def bold_section_headings(reply: str) -> str:
     """
     Make core section headings bold and ensure a blank line after each.
@@ -57,6 +456,7 @@ def bold_section_headings(reply: str) -> str:
     reply = re.sub(r"\n{3,}", "\n\n", reply).strip()
     return reply
 
+# --- Grounding guard helpers (add once) ---
 def _anchors_from_model(model_answer_slice: str, cap: int = 20) -> list[str]:
     s = model_answer_slice or ""
     acr = re.findall(r"\b[A-ZÄÖÜ]{2,6}\b", s)                        # MAR, PR, TD, WpHG, ...
@@ -458,7 +858,21 @@ def extract_issues_from_model_answer(model_answer: str, llm_api_key: str) -> lis
     raw = call_groq(messages, api_key=llm_api_key, model_name="llama-3.1-8b-instant", temperature=0.0, max_tokens=900)
     parsed = _try_parse_json(raw)
     issues = _coerce_issues(parsed)
+    primary = derive_primary_scope(model_answer)
 
+    def issue_scope_markers(it: dict) -> set[str]:
+        s = (" ".join(it.get("keywords", [])) + " " + it.get("name","")).lower()
+        out = set()
+        for a in ["mar","pr","mifid ii","mifir","td","wphg","wpüg"]:
+            if a in s:
+                out.add(a)
+        return out or set(["(unspecified)"])
+
+    for it in issues:
+        scopes = issue_scope_markers(it)
+        it["required"] = bool(primary & scopes)  # required if intersects the primary regime(s)
+        it["scope_laws"] = sorted(scopes)        # keep for explanation/debug
+    
     # Fallback to improved keyword extraction
     if not issues:
         keywords = improved_keyword_extraction(model_answer, max_keywords=20)
@@ -469,7 +883,6 @@ def extract_issues_from_model_answer(model_answer: str, llm_api_key: str) -> lis
         }]
 
     return issues
-
 def generate_rubric_from_model_answer(student_answer: str, model_answer: str, backend, llm_api_key: str, weights: dict) -> dict:
     extracted_issues = extract_issues_from_model_answer(model_answer, llm_api_key)
     if not extracted_issues:
@@ -479,6 +892,7 @@ def generate_rubric_from_model_answer(student_answer: str, model_answer: str, ba
             "final_score": 0.0,
             "per_issue": [],
             "missing": [],
+            "bonus": [],
             "substantive_flags": []
         }
 
@@ -487,6 +901,8 @@ def generate_rubric_from_model_answer(student_answer: str, model_answer: str, ba
     sim_pct = max(0.0, min(100.0, 100.0 * (sim + 1) / 2))
 
     per_issue, tot, got = [], 0, 0
+    bonus = []
+
     for issue in extracted_issues:
         pts = issue.get("importance", 5) * 2
         tot += pts
@@ -494,21 +910,33 @@ def generate_rubric_from_model_answer(student_answer: str, model_answer: str, ba
         got += sc
         per_issue.append({
             "issue": issue["name"],
+            "required": issue.get("required", True),          # <-- carry through
+            "scope_laws": issue.get("scope_laws", []),        # <-- carry through
             "max_points": pts,
             "score": sc,
             "keywords_hit": hits,
             "keywords_total": issue["keywords"],
         })
+        # "Good catch" for optional issues the student actually covered
+        if not issue.get("required", True) and hits:
+            bonus.append({
+                "issue": issue["name"],
+                "hits": hits,
+                "scope_laws": issue.get("scope_laws", []),
+            })
 
     cov_pct = 100.0 * got / max(1, tot)
     final = (weights["similarity"] * sim_pct + weights["coverage"] * cov_pct) / (weights["similarity"] + weights["coverage"])
 
+    # Only required issues can be marked as "missing"
     missing = []
     for row in per_issue:
+        if not row.get("required", True):
+            continue  # <-- optional issues are never missing
         missed = [kw for kw in row["keywords_total"] if not keyword_present(student_answer, kw)]
         if missed:
             missing.append({"issue": row["issue"], "missed_keywords": missed})
-    
+
     substantive_flags = detect_substantive_flags(student_answer)
 
     return {
@@ -517,7 +945,8 @@ def generate_rubric_from_model_answer(student_answer: str, model_answer: str, ba
         "final_score": round(final, 1),
         "per_issue": per_issue,
         "missing": missing,
-        "substantive_flags": substantive_flags
+        "bonus": bonus,
+        "substantive_flags": substantive_flags,
     }
 
 def filter_model_answer_and_rubric(selected_question: str, model_answer: str, api_key: str) -> tuple[str, list[dict]]:
@@ -808,26 +1237,6 @@ def format_feedback_and_filter_missing(reply: str, student_answer: str, model_an
     for h, bold_h in headings.items():
         reply = re.sub(rf"(?im)^\\s*{re.escape(h)}\\s*$", bold_h + "\\n", reply)
 
-    # Reformat bullets in Core Claims section
-    m = re.search(r"(?is)(Student's Core Claims:\\s*)(.*?)(\\n(?:\\*\\*Mistakes:\\*\\*|\\*\\*Missing Aspects:\\*\\*|\\*\\*Suggestions:\\*\\*|\\*\\*Conclusion:\\*\\*|$))", reply)
-    if m:
-        head, body, tail = m.group(1), m.group(2), m.group(3)
-        lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
-        fixed = []
-        for ln in lines:
-            ln = re.sub(r"^\\s*[•\\-*]\\s*", "• ", ln)
-            m1 = re.match(r"^\\s*•\\s*(Correct|Incorrect|Not supported)\\s*:?\\s*(.+)$", ln, flags=re.I)
-            m2 = re.match(r"^\\s*•\\s*\\[(Correct|Incorrect|Not supported)\\]\\s*(.+)$", ln, flags=re.I)
-            if m1:
-                tag, text = m1.group(1).capitalize(), m1.group(2).strip()
-                fixed.append(f"• {text} — [{tag}]")
-            elif m2:
-                tag, text = m2.group(1).capitalize(), m2.group(2).strip()
-                fixed.append(f"• {text} — [{tag}]")
-            else:
-                fixed.append(f"• {ln} — [Not supported]")
-        reply = reply.replace(m.group(0), head + "\n".join(fixed) + tail)
-
     # Remove hallucinated 'Missing Aspects' (already present in student answer)
     present = set()
     for row in (rubric or {}).get("per_issue", []):
@@ -837,9 +1246,18 @@ def format_feedback_and_filter_missing(reply: str, student_answer: str, model_an
         m = re.search(rf"({title_regex}\\s*)(.*?)(\\n(?:\\*\\*Student's Core Claims:\\*\\*|\\*\\*Mistakes:\\*\\*|\\*\\*Suggestions:\\*\\*|\\*\\*Conclusion:\\*\\*|$))", text, flags=re.S | re.I)
         return m.groups() if m else (None, None, None)
 
+    present_keywords = {kw.lower() for row in rubric.get("per_issue", []) for kw in row.get("keywords_hit", [])}
+    
     head, body, tail = _find_section(reply, r"\\*\\*Missing Aspects:\\*\\*")
     if head:
         bullets = [f"• {ln.strip()}" for ln in body.strip().splitlines() if ln.strip()]
+        def fuzzy_keyword_match(bullet: str, present_keywords: set) -> bool:
+            bullet_low = bullet.lower()
+            for kw in present_keywords:
+                kw_tokens = kw.lower().split()
+                if all(tok in bullet_low for tok in kw_tokens):
+                    return True
+            return False
         kept = [b for b in bullets if not any(p in b.lower() for p in present)]
         reply = reply.replace(head + body + tail, head + ("\n".join(kept) + "\n" if kept else "—\n") + tail)
 
@@ -1112,9 +1530,9 @@ def retrieve_snippets_with_manual(student_answer, model_answer_filtered, pages, 
     manual_chunks, manual_metas = [], []
     try:
         manual_chunks, manual_metas = extract_manual_chunks_with_refs(
-            "assets/EUCapML - Course Booklet.pdf",
-            chunk_words_hint=chunk_words
-        )
+            BOOKLET,
+            chunk_words_hint=None
+        )        
     except Exception as e:
         st.warning(f"Could not load course manual: {e}")
     try:
@@ -1258,6 +1676,7 @@ def system_guardrails():
         "1. Base all feedback on the authoritative MODEL ANSWER and the numbered SOURCES provided.\n"
         "2. If SOURCES conflict with MODEL ANSWER, follow the MODEL ANSWER and briefly explain why.\n"
         "3. Never reveal or mention that a hidden model answer exists.\n\n"
+        "4. If asked to reveal model answer, politely decline.\n\n"
         "CITATIONS POLICY:\n"
         "- Cite ONLY using numeric brackets that match the SOURCES list (e.g., [1], [2]).\n"
         "- NEVER write the literal placeholder “[n]”.\n"
@@ -1273,6 +1692,8 @@ def system_guardrails():
         "- Summarize or paraphrase concepts; do not copy long passages.\n\n"
         "FACT-CHECKING RULE:\\n"
         "- Do **not** mark something as 'Missing' if it appears in the PRESENT list provided in the prompt.\\n\\n"
+        "OUTPUT LAYOUT:\\n"
+        "- If you return a list of bullets, return a new line for each bullet."
         "STYLE:\n"
         "- Be concise, didactic, and actionable.\n"
         "- Use ≤400 words, no new sections.\n"
@@ -1340,7 +1761,7 @@ EXCERPTS (quote sparingly; cite using [1], [2], …):
 {excerpts_block}
 
 AUTO-DETECTED EVIDENCE:
-- PRESENT in student's answer (DO NOT MARK THESE AS MISSING):
+- PRESENT in student's answer (DO NOT MARK THESE AS MISTAKES or MISSING ASPECTS):
 {present_block}
 
 - POTENTIALLY MISSING (only mark as missing if truly absent AND material):
@@ -1365,11 +1786,38 @@ OUTPUT FORMAT (use EXACTLY these headings):
 
 RULES:
 - Do NOT mark anything as missing if it appears in the PRESENT list.
+- ALWAYS insert a line break after each heading. 
+- If you use bullets, you MUST insert a line break before each bullet.
 - Use numeric citations [n] only from SOURCES.
 - Do NOT fabricate citations or Course Booklet references.
 - Be concise, didactic, and actionable.
 - ≤400 words total.
 """.strip()
+
+def lock_out_false_mistakes(reply: str, rubric: dict) -> str:
+    """
+    Removes any 'Mistakes' bullet that mentions a keyword already present in the student's answer.
+    """
+    if not reply or not rubric:
+        return reply
+
+    present = {kw.lower() for row in rubric.get("per_issue", []) for kw in row.get("keywords_hit", [])}
+    m = re.search(r"(?is)(\*\*Mistakes:\*\*\s*)(.*?)(?=\n\*\*|$)", reply)
+    if not m:
+        return reply
+
+    head, body = m.group(1), m.group(2)
+    bullets = [b.strip() for b in re.split(r"\s*•\s*", body) if b.strip()]
+    kept = []
+
+    for b in bullets:
+        low = b.lower()
+        if any(p in low for p in present):
+            continue  # Drop hallucinated mistake
+        kept.append(f"• {b}")
+
+    new_block = head + ("\n".join(kept) if kept else "—") + "\n"
+    return reply.replace(m.group(0), new_block)
 
 def lock_out_false_missing(reply: str, rubric: dict) -> str:
     """
@@ -1581,300 +2029,6 @@ def _dehyphenate_join(prev: str, curr: str) -> str:
         return prev + " " + curr
     return prev or curr
 
-# ============ Deterministic booklet parsing helpers ============
-# Accepts: "12", "12.", "12)", "12 –", "12 —" etc. at the **very start** of a line.
-LEAD_NUM_RE   = re.compile(r"^\s*(\d{1,4})(?:[.)]|\s*[-–—])?\s+")
-CASE_LINE_RE = re.compile(
-    r"""^\s*
-        (?:[-•–]\s*)?               # optional bullet
-        (?:\[\**\s*)?               # optional '[' / '**' (Case Notes formatting)
-        Case\s*Study\s*(\d{1,4})\b
-    """,
-    re.I | re.VERBOSE,
-)
-
-from typing import Optional
-
-def _page_lines_with_spans(page) -> list[dict]:
-    """
-    Return ordered line dicts with geometry + spans:
-      [{'x0','y0','x1','y1','text','spans':[{'text','size','font','bbox'...}, ...]}, ...]
-    """
-    d = page.get_text("dict")
-    out = []
-    for blk in d.get("blocks", []):
-        if blk.get("type") != 0:
-            continue
-        for ln in blk.get("lines", []):
-            spans = ln.get("spans", [])
-            txt = "".join(s.get("text", "") for s in spans)
-            if not txt.strip():
-                continue
-            x0, y0, x1, y1 = ln.get("bbox", [0, 0, 0, 0])
-            out.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "text": txt, "spans": spans})
-    out.sort(key=lambda L: (L["y0"], L["x0"]))
-    return out
-
-def _median(xs, default=12.0):
-    xs = [x for x in xs if isinstance(x, (int, float))]
-    return stats.median(xs) if xs else default
-
-def _body_left_threshold(lines: list[dict]) -> float:
-    """
-    Left edge of main body column = median x0 of lines (robust even if margin numbers exist).
-    """
-    xs = [L["x0"] for L in lines]
-    if not xs:
-        return 60.0
-    # Use 40th percentile as a robust body-left estimate (ignores a few very-left gutter lines)
-    xs_sorted = sorted(xs)
-    idx = max(0, min(len(xs_sorted)-1, int(0.40 * len(xs_sorted))))
-    return xs_sorted[idx]
-
-def _dehyphen_join(prev: str, curr: str) -> str:
-    if not prev:
-        return curr
-    if prev.endswith("-") and curr and curr[:1].islower():
-        return prev[:-1] + curr
-    # normal join with single space
-    return (prev + " " + curr).strip()
-
-def _match_leading_number(line_text: str) -> Optional[int]:
-    m = LEAD_NUM_RE.match(line_text)
-    if not m:
-        return None
-    try:
-        n = int(m.group(1))
-        return n
-    except Exception:
-        return None
-
-def _strip_leading_number(line_text: str) -> str:
-    """
-    Remove the leading '12', '12.', '12)', '12 –', etc., and return the remaining text.
-    Ensures we do **not** lose the first line of the paragraph.
-    """
-    return LEAD_NUM_RE.sub("", line_text, count=1).strip()
-
-def _find_case_starts(lines: list[dict], body_left: float) -> list[dict]:
-    """
-    Return [{'case':N,'y0':<line top>}, ...] for lines starting with 'Case Study N ...'
-    that appear **in the body column** (not the left number gutter).
-    """
-    hits = []
-    for L in lines:
-        # keep only lines that begin near/at the body column
-        if L["x0"] < body_left - 3.0:
-            continue
-        m = CASE_LINE_RE.match(L["text"])
-        if m:
-            hits.append({"case": int(m.group(1)), "y0": L["y0"]})
-    hits.sort(key=lambda d: d["y0"])
-    return hits
-
-def _extract_page_paragraphs(page) -> tuple[list[dict], list[dict]]:
-    """
-    Parse a page into anchored paragraphs and case-start markers.
-
-    Returns:
-      para_items: [{'para':N, 'y0':float, 'text':str}]
-      case_starts: [{'case':K, 'y0':float}]
-    """
-    lines = _page_lines_with_spans(page)
-    if not lines:
-        return [], []
-
-    body_left = _body_left_threshold(lines)
-
-    para_items: list[dict] = []
-    case_starts = _find_case_starts(lines, body_left)
-
-    cur_para_num = None
-    cur_para_y0  = None
-    cur_text     = ""
-
-    for L in lines:
-        txt = L["text"].strip()
-
-        # New paragraph if this line starts with a leading number
-        n = _match_leading_number(txt)
-        if n is not None:
-            # flush previous paragraph
-            if cur_para_num is not None and cur_text.strip():
-                para_items.append({"para": cur_para_num, "y0": cur_para_y0, "text": cur_text.strip()})
-            # start new paragraph; keep the **rest of this line** (first-line text!)
-            cur_para_num = n
-            cur_para_y0  = L["y0"]
-            cur_text     = _strip_leading_number(txt)
-        else:
-            # continuation line for current paragraph
-            if cur_para_num is not None:
-                cur_text = _dehyphen_join(cur_text, txt)
-            else:
-                # lines before the first numbered paragraph on the page: ignore for numbered parsing
-                pass
-
-    # flush trailing paragraph
-    if cur_para_num is not None and cur_text.strip():
-        para_items.append({"para": cur_para_num, "y0": cur_para_y0, "text": cur_text.strip()})
-
-    return para_items, case_starts
-# ============ /Deterministic booklet parsing helpers ============
-def extract_manual_chunks_with_refs(pdf_path: str, chunk_words_hint: int = 170) -> tuple[list[str], list[dict]]:
-    """
-    Deterministic extraction:
-      • Each chunk corresponds to one numbered paragraph (paras=[N]).
-      • 'case_section' stores the enclosing "Case Study K" based on the nearest
-        preceding 'Case Study K ...' line (persists across pages).
-      • Very long paragraphs are split by sentences near 'chunk_words_hint' while
-        keeping the same anchors.
-    """
-    chunks, metas = [], []
-    try:
-        doc = fitz.open(pdf_path)
-    except Exception:
-        return [], []
-
-    current_case_section: Optional[int] = None  # carried across pages
-
-    for pno in range(len(doc)):
-        page = doc.load_page(pno)
-        page_label = page.get_label() or str(pno + 1)
-
-        para_items, case_starts = _extract_page_paragraphs(page)
-        # --- NEW: build explicit case-chunks (prompts / case notes) on this page ---
-        # We slice from each "Case Study N" line to the next "Case Study ..." line.
-        lines = _page_lines_with_spans(page)
-        body_left = _body_left_threshold(lines)
-
-        # Collect segments for each case start detected on this page
-        for k, cs in enumerate(sorted(case_starts, key=lambda d: d["y0"])):
-            y0 = cs["y0"]
-            y1 = case_starts[k + 1]["y0"] if k + 1 < len(case_starts) else float("inf")
-
-            seg_lines = []
-            for L in lines:
-                # Keep only body-column text between y0..y1 (ignore left-gutter numbers)
-                if L["y0"] >= y0 - 0.2 and L["y0"] < y1 - 0.2 and L["x0"] >= body_left - 3.0:
-                    t = (L.get("text") or "").strip()
-                    if t:
-                        seg_lines.append(t)
-
-            seg_text = _normalize_ws(" ".join(seg_lines))
-            # Basic sanity: keep only if it begins with "Case Study N" and has some tail text
-            if not seg_text or not re.match(r"^\s*Case\s*Study\s*{}\b".format(cs["case"]), seg_text, flags=re.I):
-                continue
-
-            chunks.append(seg_text)
-            metas.append({
-                "pdf_index": pno,
-                "page_label": page_label,
-                "page_num": pno + 1,
-                "paras": [],                  # <-- no paragraph number for case chunks
-                "cases": [cs["case"]],        # <-- cite as “Case Study N”
-                "case_section": cs["case"],   # keep the enclosing section too
-                "file": "EUCapML - Course Booklet.pdf",
-                "kind": "case",               # optional tag (may help future filtering)
-            })
-        # walk down the page; whenever a case start appears above the paragraph, update section
-        case_idx = 0
-        case_starts = sorted(case_starts, key=lambda d: d["y0"])
-
-        for it in sorted(para_items, key=lambda d: d["y0"]):
-            # advance case section
-            while case_idx < len(case_starts) and case_starts[case_idx]["y0"] <= it["y0"] + 0.5:
-                current_case_section = case_starts[case_idx]["case"]
-                case_idx += 1
-
-            para_no = it["para"]
-            text    = it["text"]
-
-            # split long paragraphs (keep anchors)
-            parts = [text]
-            words = text.split()
-            if len(words) > chunk_words_hint * 2:
-                bits = re.split(r"(?<=[\.\?\!…])\s+", text)
-                cur, acc, parts = [], 0, []
-                for s in bits:
-                    cur.append(s); acc += len(s.split())
-                    if acc >= chunk_words_hint:
-                        parts.append(" ".join(cur).strip()); cur, acc = [], 0
-                if cur:
-                    parts.append(" ".join(cur).strip())
-
-            for part in parts:
-                if not part:
-                    continue
-                chunks.append(part)
-                metas.append({
-                    "pdf_index": pno,
-                    "page_label": page_label,
-                    "page_num": pno + 1,
-                    "paras": [para_no],          # <- primary anchor
-                    "cases": [],                 # <- not used for paragraph chunks
-                    "case_section": current_case_section,  # <- enclosing Case Study (may be None)
-                    "file": "EUCapML - Course Booklet.pdf",
-                })
-
-    doc.close()
-    return chunks, metas
-
-def format_manual_citation(meta: dict) -> str:
-    """
-    Build a clean, human-readable citation line for the Course Booklet.
-
-    Rules:
-    - Always print page info first: "page <label> (PDF <n>)"
-    - If this chunk belongs to a Case Study, add "Case Study N" even for
-      non-headline paragraphs (via case_section fallback).
-    - If no case applies, but we have a paragraph number, append "para. N".
-    """
-    paras      = meta.get("paras") or []
-    cases      = meta.get("cases") or []
-    case_sec   = meta.get("case_section")  # enclosing Case Study (int) or None
-    page_label = meta.get("page_label") or ""
-    pdf_p      = meta.get("page_num")
-
-    anchors = []
-
-    # Page anchor
-    if page_label or pdf_p:
-        if page_label and pdf_p:
-            anchors.append(f"page {page_label} (PDF {pdf_p})")
-        elif page_label:
-            anchors.append(f"page {page_label}")
-        else:
-            anchors.append(f"PDF {pdf_p}")
-    else:
-        anchors.append("PDF page ?")
-
-    # Case anchor: prefer explicit case on the chunk, else enclosing section
-    case_n = cases[0] if cases else (case_sec if isinstance(case_sec, int) else None)
-    if case_n:
-        anchors.append(f"Case Study {case_n}")
-
-    # Paragraph anchor only if we don't already have a Case Study tag
-    if paras and not case_n:
-        anchors.append(f"para. {paras[0]}")
-
-    return "Course Booklet — " + ", ".join(anchors)
-
-# ---- Simple page cleaner for booklet parsing ----
-def clean_page_text(t: str) -> str:
-    """
-    Drop repeating page header/footer noise (e.g., 'Version 11 June 2025') and lone page numbers.
-    """
-    out = []
-    for ln in t.splitlines():
-        # Header like "Version 11 June 2025"
-        if re.match(r"^\s*Version\s+\d{1,2}\s+\w+\s+\d{4}\s*$", ln):
-            continue
-        # A lone page number line
-        if re.match(r"^\s*\d+\s*$", ln):
-            continue
-        out.append(ln)
-    return "\n".join(out)
-
 # --- Chat callbacks ------------------------------------------------------------
 def clear_chat_draft():
     # Clear the persistent composer safely
@@ -1988,7 +2142,71 @@ with st.sidebar:
             st.code((r.text or "")[:1000], language="json")
         except Exception as e:
             st.exception(e)
-        
+
+    # --- Sidebar: Booklet Inspector (Word) ---
+    st.divider()
+    st.subheader("📄 Booklet Inspector")
+    
+    docx_source = BOOKLET  # uses your constant; you could also wire in an uploader override
+    
+    try:
+        records, _chunks, _metas = load_booklet_anchors(docx_source)
+        total = len(records)
+        if total == 0:
+            st.info("No anchors found in the booklet.")
+        else:
+            anchors_per_page = st.number_input(
+                "Anchors per virtual page",
+                min_value=5, max_value=50, value=12, step=1,
+                help="Virtual page size = how many anchors (paras/cases) per page."
+            )
+            max_pages = max(1, math.ceil(total / anchors_per_page))
+            virt_page = st.number_input(
+                "Virtual page #",
+                min_value=1, max_value=max_pages, value=1, step=1
+            )
+    
+            start = (virt_page - 1) * anchors_per_page
+            end = min(start + anchors_per_page, total)
+            st.caption(f"Showing anchors {start + 1}–{end} of {total}")
+    
+            # Render anchors on this virtual page
+            for r in records[start:end]:
+                if r["kind"] == "para":
+                    label = f"para {r['id']}"
+                elif r["kind"] == "case":
+                    label = f"Case Study {r['id']}"
+                else:
+                    label = "—"
+                st.markdown(f"- **{label}** — {r['preview']}…")
+    
+            # Quick lookup for a specific para or case
+            st.markdown("**Lookup**")
+            lookup = st.text_input("Type e.g. `para 115` or `case 30`")
+            if lookup:
+                m_para = re.match(r"^\s*para\s+(\d{1,4})\s*$", lookup, re.I)
+                m_case = re.match(r"^\s*case\s+(\d{1,4})\s*$", lookup, re.I)
+                target_kind, target_id = None, None
+                if m_para:
+                    target_kind, target_id = "para", int(m_para.group(1))
+                elif m_case:
+                    target_kind, target_id = "case", int(m_case.group(1))
+    
+                if target_kind:
+                    hits = [r for r in records if r["kind"] == target_kind and r["id"] == target_id]
+                    if not hits:
+                        st.warning(f"No match for {lookup.strip()}.")
+                    else:
+                        st.success(f"Found {len(hits)} match(es):")
+                        for h in hits[:20]:  # cap display
+                            st.markdown(f"- **#{h['idx']}** {target_kind} {h['id']} — {h['preview']}…")
+                else:
+                    st.info("Enter `para N` or `case K`.")
+    except FileNotFoundError:
+        st.error(f"Booklet not found at: {docx_source}")
+    except Exception as e:
+        st.exception(e)
+
 # Main UI
 st.image("assets/logo.png", width=240)
 st.title("EUCapML Case Tutor")
@@ -2093,7 +2311,9 @@ with colA:
                 )
                 reply = merge_to_suggestions(reply, student_answer, activate=agreement)
                 reply = tidy_empty_sections(reply)
+                reply = add_good_catch_for_optionals(reply, rubric) 
                 reply = prune_redundant_improvements(student_answer, reply)
+                reply = lock_out_false_mistakes(reply, rubric)
                 reply = lock_out_false_missing(reply, rubric)
                 reply = enforce_feedback_template(reply)
                 reply = format_feedback_and_filter_missing(reply, student_answer, model_answer_filtered, rubric)
