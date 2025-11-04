@@ -4,32 +4,39 @@
 # - Web retrieval from EUR-Lex, CURIA, ESMA, BaFin, Gesetze-im-Internet
 # - Hidden model answer is authoritative; citations [1], [2] map to sources
 
-import os
-import re
-import json
 import hashlib
-import pathlib
-from typing import List, Dict, Tuple
-from urllib.parse import quote_plus, urlparse
+import json
+import math
 import numpy as np
+import os
+import pathlib
+import re
+import requests
 import streamlit as st
-import statistics as stats
+
+from bs4 import BeautifulSoup
+from docx import Document
+from docx import Document
+from docx.text.paragraph import Paragraph
+from docx.table import Table, _Cell
+from docx.oxml.text.paragraph import CT_P
+from docx.oxml.table import CT_Tbl
+from docx.document import Document as _Document
+from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
-import requests
-from bs4 import BeautifulSoup
+from typing import List, Dict, Any, Tuple, Union, IO
+from urllib.parse import quote_plus, urlparse
+
 BOOKLET = "assets/EUCapML - Course Booklet.docx"
 
 # ---------------- Build fingerprint (to verify latest deployment) ----------------
 APP_HASH = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:10]
 
 # --------------------------- WORD-ONLY PARSER + CITATIONS ---------------------------
-import re
-from typing import List, Dict, Any, Tuple, Union, IO
-from docx import Document
 
 # --- Compact citation formatter (no PDF assumptions) ---
-def format_manual_citation(meta: Dict[str, Any]) -> str:
+def format_booklet_citation(meta: Dict[str, Any]) -> str:
     """
     Produces labels like:
       - "see Course Booklet para. 27"
@@ -47,14 +54,6 @@ def format_manual_citation(meta: Dict[str, Any]) -> str:
     return "see Course Booklet"
 
 # --- Word-based parser: extracts numbered paragraphs and case sections ---
-import re
-from typing import List, Dict, Any, Tuple, Union, IO
-from docx import Document
-from docx.text.paragraph import Paragraph
-from docx.table import Table, _Cell
-from docx.oxml.text.paragraph import CT_P
-from docx.oxml.table import CT_Tbl
-from docx.document import Document as _Document
 
 PARA_RE_DOTSAFE = re.compile(r"^(\d{1,4})\b(?!\.)")              # 12 but not 1.1
 CASE_RE = re.compile(r"^Case\s*Study\s*(\d{1,4})\b", re.I)
@@ -179,14 +178,14 @@ def _flush(current: Dict[str, Any], buf: List[str],
     if meta["cases"]:
         k = meta["cases"][0]
         meta["title"] = f"see Course Booklet Case Study {k}"
-        meta["url"]   = f"manual+docx://case/{k}"
+        meta["url"]   = f"booklet+docx://case/{k}"
     elif meta["paras"]:
         n = meta["paras"][0]
         meta["title"] = f"see Course Booklet para. {n}"
-        meta["url"]   = f"manual+docx://para/{n}"
+        meta["url"]   = f"booklet+docx://para/{n}"
     else:
         meta["title"] = "see Course Booklet"
-        meta["url"]   = "manual+docx://booklet"
+        meta["url"]   = "booklet+docx://booklet"
     out_chunks.append(text)
     out_metas.append(meta)
 
@@ -324,8 +323,8 @@ def parse_booklet_docx(docx_source: Union[str, IO[bytes]]
     _flush(current, buf, chunks, metas)
     return chunks, metas
 
-# --- Compatibility shim for existing code that expects extract_manual_chunks_with_refs(...) ---
-def extract_manual_chunks_with_refs(docx_source: Union[str, IO[bytes]],
+# --- Compatibility shim for existing code that expects extract_booklet_chunks_with_refs(...) ---
+def extract_booklet_chunks_with_refs(docx_source: Union[str, IO[bytes]],
                                     chunk_words_hint: int | None = None
                                    ) -> Tuple[List[str], List[Dict[str, Any]]]:
     """
@@ -334,9 +333,6 @@ def extract_manual_chunks_with_refs(docx_source: Union[str, IO[bytes]],
     return parse_booklet_docx(docx_source)
 
 # --- Cached loader for parsed anchors (Word) ---
-import math
-from typing import Union, IO, Any, List, Dict, Tuple
-
 @st.cache_data(show_spinner=False)
 def load_booklet_anchors(docx_source: Union[str, IO[bytes]]) -> Tuple[List[Dict[str, Any]], List[str], List[Dict[str, Any]]]:
     """
@@ -345,7 +341,7 @@ def load_booklet_anchors(docx_source: Union[str, IO[bytes]]) -> Tuple[List[Dict[
       chunks:  raw text chunks (same order)
       metas:   per-chunk metadata (same order)
     """
-    chunks, metas = extract_manual_chunks_with_refs(docx_source, chunk_words_hint=None)
+    chunks, metas = extract_booklet_chunks_with_refs(docx_source, chunk_words_hint=None)
 
     def first_words(text: str, n=10) -> str:
         toks = (text or "").split()
@@ -371,7 +367,6 @@ def load_booklet_anchors(docx_source: Union[str, IO[bytes]]) -> Tuple[List[Dict[
 
 # ---------- Public helpers you will call from the app ----------
 def add_good_catch_for_optionals(reply: str, rubric: dict) -> str:
-    import re
     bonus = rubric.get("bonus") or []
     if not reply or not bonus:
         return reply
@@ -395,7 +390,6 @@ def derive_primary_scope(model_answer_slice: str, top_k: int = 2) -> set[str]:
     Uses boundary-aware counts and penalizes regimes that are explicitly marked
     "not expected / not required / outside scope". Generic and scalable.
     """
-    import re
     text = (model_answer_slice or "")
 
     # Boundary-aware patterns; include common aliases. Extendable over time.
@@ -430,8 +424,7 @@ def bold_section_headings(reply: str) -> str:
     """
     if not reply:
         return reply
-    import re
-
+    
     # 1) Canonicalise a few heading variants (defensive)
     reply = re.sub(r"(?im)^\s*CLAIMS\s*:\s*$", "Student's Core Claims:", reply)
     
@@ -479,7 +472,6 @@ def prune_redundant_improvements(student_answer: str, reply: str) -> str:
     """
     if not reply:
         return reply
-    import re
     anchors = [
         r"\bLafonta\b",
         r"\bArt(?:icle)?\s*7\s*\(\s*2\s*\)\b",
@@ -518,7 +510,6 @@ def load_embedder():
     Try a small sentence-transformer; if unavailable (e.g., install timeouts), fall back to TF-IDF.
     """
     try:
-        from sentence_transformers import SentenceTransformer
         model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
         return ("sbert", model)
     except Exception:
@@ -585,7 +576,6 @@ c)  Failure to disclose under § 33 WpHG/§ 35 WpÜG will suspend Unicorn’s sh
 """
 
 # ---------------- Scoring Rubric ----------------
-import json
 
 # ---------- Helpers for robust JSON extraction ----------
 def _first_json_block(s: str):
@@ -760,10 +750,6 @@ def _auto_issues_from_text(text: str, max_issues: int = 8) -> list[dict]:
 
     return issues
 # ---------- Main extractor (no hard-coded topics) ----------
-import re
-from sklearn.feature_extraction.text import TfidfVectorizer
-import numpy as np
-
 def improved_keyword_extraction(text: str, max_keywords: int = 20) -> list[str]:
     if not text:
         return []
@@ -987,16 +973,12 @@ def canonicalize(s: str, strip_paren_numbers: bool = False) -> str:
     s = re.sub(r"[^a-z0-9§]", "", s)
     return s
 
-import re
-
-
 def keyword_present(answer: str, kw: str) -> bool:
     """
     Detects presence of compound legal references like 'article 17(4)(a) MAR' or '§ 33 WpHG'
     even if the student mentions the article/paragraph and the law name separately.
     """
-    import re
-
+    
     def canonicalize(s: str) -> str:
         s = s.lower()
         s = s.replace("art.", "art").replace("article", "art").replace("–", "-")
@@ -1071,7 +1053,6 @@ def _find_section(text: str, title_regex: str):
     Return (head, body, tail, span) for the section whose title matches title_regex.
     If not found, returns (None, None, None, None).
     """
-    import re
     m = re.search(
         rf"({title_regex}\s*)(.*?)(\n(?:Student's Core Claims:|Mistakes:|Missing Aspects:|Suggestions:|Conclusion|📚|Sources used|$))",
         text,
@@ -1085,7 +1066,6 @@ def _neutralise_error_tone(line: str) -> str:
     """
     Turn blamey phrasing into 'suggestion' tone.
     """
-    import re
     s = line
     s = re.sub(r"\b[Tt]he student incorrectly (states|assumes|concludes)\b", "Consider also", s)
     s = re.sub(r"\b[Tt]his is incorrect because\b", "Rationale:", s)
@@ -1129,7 +1109,6 @@ def merge_to_suggestions(reply: str, student_answer: str, activate: bool = True)
     tmp = "".join(parts)
 
     # 4) Insert Suggestions before Conclusion
-    import re
     suggestions_block = ""
     if suggestions:
         suggestions_block = "Suggestions:\n" + "\n".join(suggestions) + "\n\n"
@@ -1147,7 +1126,6 @@ def tidy_empty_sections(reply: str) -> str:
     """
     if not reply:
         return reply
-    import re
     # Remove empty sections like 'Missing Aspects:' followed by '—' or blank lines
     reply = re.sub(r"(Missing Aspects:\s*)(?:—\s*|\s*)(?=\n(?:Conclusion|📚|Sources used|$))",
                    "", reply, flags=re.S | re.I)
@@ -1214,8 +1192,7 @@ def format_feedback_and_filter_missing(reply: str, student_answer: str, model_an
     - Conclusion
     Each section is formatted with bullet points and explanations where needed.
     """
-    import re
-
+    
     if not reply:
         return reply
 
@@ -1516,25 +1493,25 @@ def collect_corpus(student_answer: str, extra_user_q: str, max_fetch: int = 20) 
             fetched.append(pg)
     return fetched
 
-# ---- Manual relevance terms per question ----
-def manual_chunk_relevant(text: str, extracted_keywords: list[str], user_query: str = "") -> bool:
+# ---- Booklet relevance terms per question ----
+def booklet_chunk_relevant(text: str, extracted_keywords: list[str], user_query: str = "") -> bool:
     q_terms = [w.lower() for w in re.findall(r"[A-Za-zÄÖÜäöüß0-9\-]{3,}", user_query or "")]
     keys = [k.lower() for k in (extracted_keywords or [])]
     tgt = text.lower()
     return any(k in tgt for k in (keys + q_terms))
 
 
-def retrieve_snippets_with_manual(student_answer, model_answer_filtered, pages, backend,
+def retrieve_snippets_with_booklet(student_answer, model_answer_filtered, pages, backend,
                                   extracted_keywords, user_query: str = "",
                                   top_k_pages=8, chunk_words=170):
-    manual_chunks, manual_metas = [], []
+    booklet_chunks, booklet_metas = [], []
     try:
-        manual_chunks, manual_metas = extract_manual_chunks_with_refs(
+        booklet_chunks, booklet_metas = extract_booklet_chunks_with_refs(
             BOOKLET,
             chunk_words_hint=None
         )        
     except Exception as e:
-        st.warning(f"Could not load course manual: {e}")
+        st.warning(f"Could not load course booklet: {e}")
     try:
         _model_anchors = _anchors_from_model(model_answer_filtered)
     except Exception as _e:
@@ -1543,36 +1520,36 @@ def retrieve_snippets_with_manual(student_answer, model_answer_filtered, pages, 
     if _model_anchors:
         alow = [a.lower() for a in _model_anchors]
         mc2, mm2 = [], []
-        for ch, meta in zip(manual_chunks, manual_metas):
+        for ch, meta in zip(booklet_chunks, booklet_metas):
             txt = (ch or "").lower()
             if any(a in txt for a in alow):
                 mc2.append(ch)
                 mm2.append(meta)
         if mc2:  # shrink only if something kept
-            manual_chunks, manual_metas = mc2, mm2
+            booklet_chunks, booklet_metas = mc2, mm2
 
     # (keep the rest unchanged)
 
-    # ✅ Filter manual chunks using keywords + the user's query AND case numbers, if any
+    # ✅ Filter booklet chunks using keywords + the user's query AND case numbers, if any
     selected_q = st.session_state.get("selected_question", "Question 1")
     uq_cases = detect_case_numbers(user_query or "")
     filtered_chunks, filtered_metas = [], []
-    for ch, m in zip(manual_chunks, manual_metas):
-        has_kw = manual_chunk_relevant(ch, extracted_keywords, user_query)
+    for ch, m in zip(booklet_chunks, booklet_metas):
+        has_kw = booklet_chunk_relevant(ch, extracted_keywords, user_query)
         case_match = bool(uq_cases and set(uq_cases).intersection(set(m.get("cases") or [])))
         if has_kw or case_match:
             filtered_chunks.append(ch)
             filtered_metas.append(m)
     if filtered_chunks:
-        manual_chunks, manual_metas = filtered_chunks, filtered_metas
+        booklet_chunks, booklet_metas = filtered_chunks, filtered_metas
     
-    # ---- Prepare manual meta tuples with a unique key per *page* so we can group snippets by page
-    manual_meta = []
-    for m in manual_metas:
+    # ---- Prepare booklet meta tuples with a unique key per *page* so we can group snippets by page
+    booklet_meta = []
+    for m in booklet_metas:
         page_key = -(m["page_num"])  
-        citation = format_manual_citation(m)  # pre-format a nice line
+        citation = format_booklet_citation(m)  # pre-format a nice line
         # We store citation in 'title' so we can reuse downstream without new structures
-        manual_meta.append((page_key, "manual://course-booklet", citation))
+        booklet_meta.append((page_key, "booklet://course-booklet", citation))
 
     # ---- Prepare web chunks (unchanged)
     # ---- Prepare web chunks (fixed: keep meta 1:1 with chunks)
@@ -1582,7 +1559,7 @@ def retrieve_snippets_with_manual(student_answer, model_answer_filtered, pages, 
         text = p.get("text", "")
         if not text:
             continue
-    # Optional relevance filter (keep if you added MANUAL_KEY_TERMS):
+    # Optional relevance filter (keep if you added BOOKLET_KEY_TERMS):
         if 'web_page_relevant' in globals() and not web_page_relevant(text, extracted_keywords):
             continue
 
@@ -1592,8 +1569,8 @@ def retrieve_snippets_with_manual(student_answer, model_answer_filtered, pages, 
             web_meta.append((i + 1, p["url"], p["title"]))  # append meta PER CHUNK
 
     # ---- Build combined corpus
-    all_chunks = manual_chunks + web_chunks
-    all_meta   = manual_meta   + web_meta
+    all_chunks = booklet_chunks + web_chunks
+    all_meta   = booklet_meta   + web_meta
     # Defensive: keep chunks and meta in lockstep
     if len(all_chunks) != len(all_meta):
         m = min(len(all_chunks), len(all_meta))
@@ -1610,7 +1587,7 @@ def retrieve_snippets_with_manual(student_answer, model_answer_filtered, pages, 
     # ✅ Similarity floor to keep only reasonably relevant snippets
     MIN_SIM = 0.22  # tune if needed
 
-    # ---- Select top snippets grouped by (manual page) or (web page index)
+    # ---- Select top snippets grouped by (booklet page) or (web page index)
     per_page = {}
     for j in idx:
         if sims[j] < MIN_SIM:
@@ -1623,12 +1600,12 @@ def retrieve_snippets_with_manual(student_answer, model_answer_filtered, pages, 
         if len(per_page) >= top_k_pages:
             break
 
-    # Order by key and build source lines. For manual items we already have 'title' as a full citation line.
+    # Order by key and build source lines. For booklet items we already have 'title' as a full citation line.
     top_pages = [per_page[k] for k in sorted(per_page.keys())][:top_k_pages]
 
     source_lines = []
     for i, tp in enumerate(top_pages):
-        if tp["url"].startswith("manual://"):
+        if tp["url"].startswith("booklet://"):
             # already a fully formatted citation like: "Course Booklet — p. ii (PDF p. 4), para. 115"
             source_lines.append(f"[{i+1}] {tp['title']}")
         else:
@@ -2011,10 +1988,6 @@ def detect_case_numbers(text: str) -> list[int]:
 
 @st.cache_resource(show_spinner=False)
 
-def _median_or_default(xs, default=12.0):
-    xs = [x for x in xs if isinstance(x, (int, float))]
-    return stats.median(xs) if xs else default
-
 def _dehyphenate_join(prev: str, curr: str) -> str:
     """
     Join two line fragments, removing soft hyphenation like: "disclo-" + "sure" -> "disclosure".
@@ -2042,34 +2015,7 @@ def reset_chat():
     # st.session_state["chat_draft"] = ""
     st.rerun()  # ensure immediate re-render
 
-def clear_last_exchange():
-    """
-    Removes the last assistant message and, if present, the immediately preceding user message.
-    Useful if the last answer was off-topic or leaked style.
-    """
-    hist = list(st.session_state.get("chat_history", []))
-    if not hist:
-        return
-    # Pop trailing whitespace/system noise if any (defensive)
-    while hist and hist[-1].get("role") not in ("user", "assistant"):
-        hist.pop()
-
-    # Remove last assistant message (if any)
-    if hist and hist[-1].get("role") == "assistant":
-        hist.pop()
-
-    # Remove the preceding user question (if any)
-    if hist and hist[-1].get("role") == "user":
-        hist.pop()
-
-    st.session_state["chat_history"] = hist
-    st.rerun()
-
 # ---------------- UI ----------------
-import streamlit as st
-import os
-import requests
-
 st.set_page_config(
     page_title="EUCapML Case Tutor", 
     page_icon="⚖️", 
@@ -2252,7 +2198,7 @@ with colA:
                 top_pages, source_lines = [], []
                 if enable_web:
                     pages = collect_corpus(student_answer, "", max_fetch=22)
-                    top_pages, source_lines = retrieve_snippets_with_manual(
+                    top_pages, source_lines = retrieve_snippets_with_booklet(
                         student_answer, model_answer_filtered, pages, backend, extracted_keywords,
                         user_query="", top_k_pages=max_sources, chunk_words=170
                     )
@@ -2377,7 +2323,7 @@ with colB:
                 extracted_keywords = [kw for issue in extracted_issues for kw in issue.get("keywords", [])]
 
                 pages = collect_corpus(student_answer, user_q, max_fetch=20)
-                top_pages, source_lines = retrieve_snippets_with_manual(
+                top_pages, source_lines = retrieve_snippets_with_booklet(
                     student_answer, model_answer_filtered, pages, backend, extracted_keywords,
                     user_query=user_q, top_k_pages=max_sources, chunk_words=170
                 )
