@@ -16,7 +16,6 @@ import streamlit as st
 
 from bs4 import BeautifulSoup
 from docx import Document
-from docx import Document
 from docx.text.paragraph import Paragraph
 from docx.table import Table, _Cell
 from docx.oxml.text.paragraph import CT_P
@@ -1895,7 +1894,7 @@ def truncate_block(s: str, max_chars: int = 3600) -> str:
     s = s or ""
     return s if len(s) <= max_chars else (s[:max_chars] + " …")
 
-def generate_with_continuation(messages, api_key, model_name, temperature=0.2, first_tokens=1200, continue_tokens=350):
+def generate_with_continuation(messages, api_key, model_name, temperature=0.2, first_tokens=2000, continue_tokens=600):
     """
     Calls the LLM, and if output ends mid-sentence, asks it to continue once.
     """
@@ -2060,7 +2059,7 @@ with st.sidebar:
 
     model_name = st.selectbox(
         "Model (free)",
-        options=["llama-3.1-8b-instant", "llama-3.1-70b-instant"],
+        options=["llama-3.1-8b-instant", "llama-3.3-70b-versatile"],
         index=0,
         help="Both are free; 8B is faster, 70B is smarter (and slower)."
     )
