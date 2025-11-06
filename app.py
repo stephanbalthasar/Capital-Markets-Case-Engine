@@ -1,6 +1,6 @@
 # app.py
 # EUCapML Case Tutor — University of Bayreuth
-# - Free LLM via Groq (llama-3.1-8b/70b-instant): no credits or payments
+# - Free LLM via Groq (llama-3.1-8b/70b-versatile): no credits or payments
 # - Web retrieval from EUR-Lex, CURIA, ESMA, BaFin, Gesetze-im-Internet
 # - Hidden model answer is authoritative; citations [1], [2] map to sources
 
@@ -461,43 +461,40 @@ def _anchors_from_model(model_answer_slice: str, cap: int = 20) -> list[str]:
             break
     return out
 
-def prune_redundant_improvements(student_answer: str, reply: str) -> str:
+def prune_redundant_improvements(student_answer: str, reply: str, rubric: dict) -> str:
     """
-    Remove bullets that recommend adding content clearly present in the student's answer.
-    Uses simple anchor regexes to detect presence.
+    Removes 'Missing Aspects' bullets that recommend adding content already present
+    in the student's answer, based on rubric-derived keyword hits.
     """
-    if not reply:
+    if not reply or not rubric:
         return reply
-    anchors = [
-        r"\bLafonta\b",
-        r"\bArt(?:icle)?\s*7\s*\(\s*2\s*\)\b",
-        r"\breasonably\s+be\s+expected\s+to\s+occur\b",
-        r"\bArt(?:icle)?\s*7\s*\(\s*4\s*\)\b",
-        r"\bArt(?:icle)?\s*17\s*\(\s*1\s*\)\b",
-        r"\bArt(?:icle)?\s*17\s*\(\s*4\s*\)\b",
-    ]
-    stu = student_answer.lower()
 
-    def present(pat: str) -> bool:
-        return re.search(pat, stu, flags=re.I) is not None
+    # Collect all keywords already detected in the student's answer
+    present_keywords = {
+        kw.lower().strip()
+        for row in rubric.get("per_issue", [])
+        for kw in row.get("keywords_hit", [])
+        if kw
+    }
 
-    m = re.search(r"(Missing Aspects:\s*)(.*?)(\n(?:Conclusion|📚|Sources used|$))",
-        reply,
-        flags=re.S | re.I
-    )    
+    # Find the 'Missing Aspects' section
+    m = re.search(r"(?is)(Missing Aspects:\s*)(.*?)(?=\n(?:Conclusion|Suggestions|Sources used|$))", reply)
     if not m:
         return reply
 
-    head, block, tail = m.group(1), m.group(2), m.group(3)
-    lines = [ln for ln in re.split(r"\n\s*•\s*", block.strip()) if ln.strip()]
+    head, body = m.group(1), m.group(2)
+    bullets = [ln.strip() for ln in re.split(r"\n\s*•\s*", body.strip()) if ln.strip()]
     kept = []
-    for ln in lines:
-        # Drop bullet if any anchor it references is already present in student answer
-        if any(re.search(p, ln, re.I) and present(p) for p in anchors):
+
+    for bullet in bullets:
+        bullet_lower = bullet.lower()
+        # Drop bullet if any present keyword appears in it
+        if any(kw in bullet_lower for kw in present_keywords):
             continue
-        kept.append(f"• {ln.strip()}")
-    new_block = ("\n".join(kept) + "\n") if kept else "—\n"
-    return reply.replace(m.group(0), head + new_block + tail)
+        kept.append(f"• {bullet}")
+
+    new_block = "\n".join(kept) if kept else "—"
+    return reply.replace(m.group(0), head + new_block + "\n")
 
 # ---------------- Embeddings ----------------
 @st.cache_resource(show_spinner=False)
@@ -837,7 +834,7 @@ def extract_issues_from_model_answer(model_answer: str, llm_api_key: str) -> lis
         {"role": "user", "content": user},
     ]
 
-    raw = call_groq(messages, api_key=llm_api_key, model_name="llama-3.1-8b-instant", temperature=0.0, max_tokens=900)
+    raw = call_groq(messages, api_key=llm_api_key, model_name=SELECTED_MODEL, temperature=0.0, max_tokens=900)
     parsed = _try_parse_json(raw)
     issues = _coerce_issues(parsed)
     primary = derive_primary_scope(model_answer)
@@ -1243,12 +1240,12 @@ def format_feedback_and_filter_missing(reply: str, student_answer: str, model_an
 # MODEL-CONSISTENCY GUARDRAIL (general, no question-specific logic)
 # =======================
 
-def _json_only(messages, api_key, model_name="llama-3.1-8b-instant", max_tokens=700):
-    """Calls Groq and returns JSON-parsed dict/list or None. Reuses call_groq + _try_parse_json present in your app."""
-    raw = call_groq(messages, api_key=api_key, model_name=model_name, temperature=0.0, max_tokens=max_tokens)
+def _json_only(messages, api_key,  model_name=None, max_tokens=700):
+    model_name = model_name or SELECTED_MODEL
+    raw = call_groq(messages, api_key=api_key, model_name=SELECTED_MODEL, temperature=0.0, max_tokens=max_tokens)
     return _try_parse_json(raw)
 
-def check_reply_vs_model_for_contradictions(model_answer: str, reply: str, api_key: str, model_name: str) -> dict:
+def check_reply_vs_model_for_contradictions(model_answer: str, reply: str, api_key: str,  model_name=None) -> dict:
     """
     Structured 'consistency critic' that flags contradictions between ASSISTANT_REPLY and MODEL_ANSWER.
     Returns: {"consistent": bool, "contradictions": [{"reply_span","model_basis","why","fix"}]}
@@ -1293,7 +1290,7 @@ def check_reply_vs_model_for_contradictions(model_answer: str, reply: str, api_k
 
     return {"consistent": not bool(clean), "contradictions": clean}
 
-def rewrite_reply_to_match_model(model_answer: str, reply: str, contradictions: list, api_key: str, model_name: str) -> str:
+def rewrite_reply_to_match_model(model_answer: str, reply: str, contradictions: list, api_key: str,  model_name=None) -> str:
     """
     Rewrites the reply to align with the MODEL_ANSWER.
     Preserves structure, ≤400 words, keeps existing [n] citations but does NOT invent new numbers.
@@ -1328,7 +1325,7 @@ def rewrite_reply_to_match_model(model_answer: str, reply: str, contradictions: 
     )
     return fixed or reply
 
-def enforce_model_consistency(reply: str, model_answer_filtered: str, api_key: str, model_name: str) -> str:
+def enforce_model_consistency(reply: str, model_answer_filtered: str, api_key: str,  model_name=None) -> str:
     """
     Detect → correct → (optionally) verify.
     If LLM unavailable or nothing to fix, returns original reply.
@@ -1610,7 +1607,7 @@ def retrieve_snippets_with_booklet(student_answer, model_answer_filtered, pages,
     return top_pages, source_lines
 
 # ---------------- LLM via Groq (free) ----------------
-def call_groq(messages: List[Dict], api_key: str, model_name: str = "llama-3.1-8b-instant",
+def call_groq(messages: List[Dict], api_key: str, model_name=None,
               temperature: float = 0.2, max_tokens: int = 700) -> str:
     """
     Groq OpenAI-compatible chat endpoint. Models like llama-3.1-8b-instant / 70b-instant are free.
@@ -1708,12 +1705,22 @@ def build_feedback_prompt(student_answer: str, rubric: dict, model_answer: str, 
     issue_names = [row["issue"] for row in rubric.get("per_issue", [])]
     present = [kw for row in rubric.get("per_issue", []) for kw in row.get("keywords_hit", [])]
     missing = [kw for m in rubric.get("missing", []) for kw in m.get("missed_keywords", [])]
-
     present_block = "• " + "\n• ".join(present) if present else "—"
     missing_block = "• " + "\n• ".join(missing) if missing else "—"
-
+    exclusion_block = ""
+    excluded = rubric.get("excluded_keywords", [])
+    if excluded:
+        exclusion_block = (
+            "\nEXCLUSION RULE:\n"
+            "The following provisions are explicitly marked in the MODEL ANSWER as not required for this question:\n"
+            + "\n".join(f"- {kw}" for kw in excluded)
+            + "\nIf the student does not mention them, do not include them in 'Missing Aspects'.\n"
+            + "If the student does mention them, evaluate correctness and include feedback if appropriate."
+        )
+    
     return f"""
 GRADE THE STUDENT'S ANSWER USING THE RUBRIC AND THE WEB/BOOKLET SOURCES.
+{exclusion_block}
 
 STUDENT ANSWER:
 \"\"\"{student_answer}\"\"\"
@@ -1894,7 +1901,7 @@ def truncate_block(s: str, max_chars: int = 3600) -> str:
     s = s or ""
     return s if len(s) <= max_chars else (s[:max_chars] + " …")
 
-def generate_with_continuation(messages, api_key, model_name, temperature=0.2, first_tokens=2000, continue_tokens=600):
+def generate_with_continuation(messages, api_key,  model_name=None, temperature=0.2, first_tokens=1500, continue_tokens=500):
     """
     Calls the LLM, and if output ends mid-sentence, asks it to continue once.
     """
@@ -2056,13 +2063,13 @@ with st.sidebar:
         st.text_input("GROQ API Key", value="Provided via secrets/env", type="password", disabled=True)
     else:
         api_key = st.text_input("GROQ API Key", type="password", help="Set GROQ_API_KEY in Streamlit Secrets for production.")
-
     model_name = st.selectbox(
         "Model (free)",
         options=["llama-3.1-8b-instant", "llama-3.3-70b-versatile"],
         index=0,
         help="Both are free; 8B is faster, 70B is smarter (and slower)."
     )
+    SELECTED_MODEL = model_name
     temp = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
 
     st.header("🌐 Web Retrieval")
@@ -2254,7 +2261,7 @@ with colA:
                 reply = merge_to_suggestions(reply, student_answer, activate=agreement)
                 reply = tidy_empty_sections(reply)
                 reply = add_good_catch_for_optionals(reply, rubric) 
-                reply = prune_redundant_improvements(student_answer, reply)
+                reply = prune_redundant_improvements(student_answer, reply, rubric)
                 reply = lock_out_false_mistakes(reply, rubric)
                 reply = lock_out_false_missing(reply, rubric)
                 reply = enforce_feedback_template(reply)
