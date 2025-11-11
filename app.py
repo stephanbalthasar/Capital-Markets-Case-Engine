@@ -13,8 +13,10 @@ import pathlib
 import re
 import requests
 import streamlit as st
+import time
 
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from docx import Document
 from docx.text.paragraph import Paragraph
 from docx.table import Table, _Cell
@@ -350,9 +352,11 @@ def load_booklet_anchors(docx_source: Union[str, IO[bytes]]) -> Tuple[List[Dict[
         })
     return records, chunks, metas
 
-## ---------------------------------------------------------------------------------------------
-
 # ---------- Public helpers you will call from the app ----------
+def _time_budget(seconds: float):
+    start = time.monotonic()
+    return lambda: time.monotonic() - start < seconds
+
 def normalize_headings(text: str) -> str:
     """Standardize and bold section headings."""
     if not text:
@@ -377,24 +381,6 @@ def normalize_headings(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
     return text
-
-def add_good_catch_for_optionals(reply: str, rubric: dict) -> str:
-    bonus = rubric.get("bonus") or []
-    if not reply or not bonus:
-        return reply
-
-    bullets = []
-    for b in bonus[:3]:  # keep it tight
-        name = b.get("issue") or "Additional point"
-        bullets.append(f"• Good catch: {name} — correct, but optional for this question.")
-
-    # Accept **Suggestions** with or without colon; normalise to with-colon
-    suggestions_hdr = re.compile(r"(?im)^\s*\*\*Suggestions\*\*:?\s*$")
-    if suggestions_hdr.search(reply):
-        reply = suggestions_hdr.sub("**Suggestions**:\n" + "\n".join(bullets) + "\n", reply, count=1)
-    else:
-        reply = reply.rstrip() + "\n\n**Suggestions**:\n" + "\n".join(bullets) + "\n"
-    return reply
 
 # --- Grounding guard helpers (add once) ---
 def _anchors_from_model(model_answer_slice: str, cap: int = 20) -> list[str]:
@@ -706,29 +692,18 @@ def generate_rubric_from_model_answer(student_answer: str, model_answer: str, ba
         got += sc
         per_issue.append({
             "issue": issue["name"],
-            "required": issue.get("required", True),          # <-- carry through
-            "scope_laws": issue.get("scope_laws", []),        # <-- carry through
             "max_points": pts,
             "score": sc,
             "keywords_hit": hits,
             "keywords_total": issue["keywords"],
         })
-        # "Good catch" for optional issues the student actually covered
-        if not issue.get("required", True) and hits:
-            bonus.append({
-                "issue": issue["name"],
-                "hits": hits,
-                "scope_laws": issue.get("scope_laws", []),
-            })
-
+        
     cov_pct = 100.0 * got / max(1, tot)
     final = (weights["similarity"] * sim_pct + weights["coverage"] * cov_pct) / (weights["similarity"] + weights["coverage"])
 
     # Only required issues can be marked as "missing"
     missing = []
     for row in per_issue:
-        if not row.get("required", True):
-            continue  # <-- optional issues are never missing
         missed = [kw for kw in row["keywords_total"] if not keyword_present(student_answer, kw)]
         if missed:
             missing.append({"issue": row["issue"], "missed_keywords": missed})
@@ -825,36 +800,6 @@ def detect_substantive_flags(answer: str) -> List[str]:
         flags.append("Delay under Art 17(4) MAR is conditional: (a) legitimate interest, (b) not misleading, (c) confidentiality ensured.")
     return flags
 
-# =======================
-# AGREEMENT MODE + TAG NORMALISATION (general, scalable)
-# =======================
-
-def in_agreement_mode(rubric: dict, sim_thresh: float = 85.0, cov_thresh: float = 70.0) -> bool:
-    """
-    True if the student's answer is highly aligned with the model answer.
-    Uses your rubric similarity & coverage (already computed).
-    """
-    try:
-        return (rubric or {}).get("similarity_pct", 0.0) >= sim_thresh and \
-               (rubric or {}).get("coverage_pct", 0.0) >= cov_thresh
-    except Exception:
-        return False
-def agreement_prompt_prelude(agreement: bool) -> str:
-    """
-    Guidance injected into the LLM prompt so it frames extras as Suggestions,
-    never as errors, when the answer is aligned.
-    """
-    if not agreement:
-        return ""
-    return (
-        "IMPORTANT RULES (agreement mode):\n"
-        "- If the student's claim matches the MODEL ANSWER, label it \"Correct\".\n"
-        "- If you want to add extra legal points (other provisions, edge cases, policy), put them under a section titled "
-        "\"Suggestions\" (or \"Further Considerations\"). Do NOT put them under 'Mistakes'.\n"
-        "- Never mark a claim as 'Incorrect' unless it directly contradicts the MODEL ANSWER.\n\n"
-    )
-
-
 def _find_section(text: str, title_regex: str):
     """
     Return (head, body, tail, span) for the section whose title matches title_regex.
@@ -878,54 +823,6 @@ def _neutralise_error_tone(line: str) -> str:
     s = re.sub(r"\b[Tt]his is incorrect because\b", "Rationale:", s)
     s = s.replace("is incorrect", "may be incomplete")
     return s
-
-
-def merge_to_suggestions(reply: str, student_answer: str, activate: bool = True) -> str:
-    """
-    When activated (agreement mode), remove 'Mistakes' and 'Missing Aspects'
-    sections and merge their content into a neutral 'Suggestions:' section.
-    """
-    if not reply or not activate:
-        return reply
-
-    # 1) Extract both sections (if any)
-    inc_head, inc_body, inc_tail, inc_span = _find_section(reply, r"Mistakes:")
-    mis_head, mis_body, mis_tail, mis_span = _find_section(reply, r"Missing Aspects:")
-
-    if not any([inc_head, mis_head]):
-        return reply
-
-    # 2) Build a combined suggestions list
-    suggestions = []
-    suggestions += [f"• {ln.strip()}" for ln in (inc_body or "").splitlines() if ln.strip()]
-    suggestions += [f"• {ln.strip()}" for ln in (mis_body or "").splitlines() if ln.strip()]
-    suggestions = [_neutralise_error_tone(s) for s in suggestions]
-    # Keep short, informative suggestions
-    suggestions = suggestions[:8]
-
-    # 3) Remove original sections by cutting spans (from end to start)
-    parts = []
-    last = 0
-    cut_spans = []
-    if inc_span: cut_spans.append(inc_span)
-    if mis_span: cut_spans.append(mis_span)
-    for s, e in sorted(cut_spans):
-        parts.append(reply[last:s])
-        last = e
-    parts.append(reply[last:])
-    tmp = "".join(parts)
-
-    # 4) Insert Suggestions before Conclusion
-    suggestions_block = ""
-    if suggestions:
-        suggestions_block = "Suggestions:\n" + "\n".join(suggestions) + "\n\n"
-    concl_sec = re.search(r"\n(?=Conclusion\b)", tmp, flags=re.I)
-    if concl_sec:
-        idx = concl_sec.start()
-        return tmp[:idx] + "\n" + suggestions_block + tmp[idx:]
-    # else append at end
-    return (tmp.rstrip() + "\n\n" + suggestions_block).rstrip() + "\n"
-
 
 def tidy_empty_sections(reply: str) -> str:
     """
@@ -981,7 +878,6 @@ def format_feedback_and_filter_missing(reply: str, student_answer: str, model_an
 
     return reply
 
-# =======================
 # MODEL-CONSISTENCY GUARDRAIL (general, no question-specific logic)
 # =======================
 
@@ -1118,7 +1014,7 @@ UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, 
 def duckduckgo_search(query: str, max_results: int = 6) -> List[Dict]:
     url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
     try:
-        r = requests.get(url, headers=UA, timeout=20)
+        r = requests.get(url, headers=UA, timeout=6)
         r.raise_for_status()
     except Exception:
         return []
@@ -1139,7 +1035,7 @@ def duckduckgo_search(query: str, max_results: int = 6) -> List[Dict]:
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_url(url: str) -> Dict:
     try:
-        r = requests.get(url, headers=UA, timeout=25)
+        r = requests.get(url, headers=UA, timeout=8)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
         for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
@@ -1153,31 +1049,85 @@ def fetch_url(url: str) -> Dict:
     except Exception:
         return {"url": url, "title": url, "text": ""}
 
-def build_queries(student_answer: str, extra_user_q: str = "") -> List[str]:
-    base = [
-        "Article 17 MAR delay disclosure ESMA guidelines site:eur-lex.europa.eu OR site:esma.europa.eu OR site:bafin.de",
-        "Article 7(2) MAR precise information intermediate step Lafonta site:curia.europa.eu OR site:eur-lex.europa.eu",
-        "Prospectus Regulation 2017/1129 Article 3(3) admission prospectus requirement site:eur-lex.europa.eu",
-        "Prospectus Regulation Article 1(5)(a) 20% exemption site:eur-lex.europa.eu",
-        "Prospectus Regulation Article 6(1) information Article 16(1) risk factors site:eur-lex.europa.eu",
-        "MiFID II Article 4(1)(44) transferable securities site:eur-lex.europa.eu",
-        "WpHG § 33 § 34(2) acting in concert gemeinschaftliches Handeln site:gesetze-im-internet.de OR site:bafin.de",
-        "WpHG § 43 Abs 1 Absichtserklärung site:gesetze-im-internet.de OR site:bafin.de",
-        "WpHG § 44 Rechte ruhen Sanktion site:gesetze-im-internet.de OR site:bafin.de",
-        "WpÜG § 29 § 30 Kontrolle 30 Prozent acting in concert site:gesetze-im-internet.de OR site:bafin.de",
-        "WpÜG § 35 Pflichtangebot Veröffentlichung BaFin site:gesetze-im-internet.de OR site:bafin.de",
-        "WpÜG § 59 Ruhen von Rechten site:gesetze-im-internet.de OR site:bafin.de",
-    ]
-    if student_answer:
-        base.append(f"({student_answer[:300]}) Neon Unicorn CFA MAR PR WpHG WpÜG site:eur-lex.europa.eu OR site:gesetze-im-internet.de")
-    if extra_user_q:
-        base.append(extra_user_q + " site:eur-lex.europa.eu OR site:gesetze-im-internet.de OR site:curia.europa.eu OR site:esma.europa.eu OR site:bafin.de")
-    return base
+def build_queries(student_answer: str, 
+    extracted_keywords: List[str], 
+    extra_user_q: str = "", 
+    max_keywords: int = 6, 
+    max_domains: int = 3
+    ) -> List[str]:
+    """
+    Dynamically builds search queries for legal sources based on extracted keywords and user input.
+    Targets EUR-Lex, CURIA, BaFin, ESMA, Gesetze-im-Internet.
 
-def collect_corpus(student_answer: str, extra_user_q: str, max_fetch: int = 20) -> List[Dict]:
+    Args:
+        student_answer (str): The student's written answer.
+        extracted_keywords (List[str]): Keywords extracted from the model answer or rubric.
+        extra_user_q (str): Optional follow-up question from the user.
+
+    Returns:
+        List[str]: A list of search queries suitable for DuckDuckGo.
+    """
+    base_queries = []
+    legal_domains = [
+        "site:eur-lex.europa.eu",
+        "site:curia.europa.eu",
+        "site:esma.europa.eu",
+        "site:bafin.de",
+        "site:gesetze-im-internet.de"
+    ]
+    # Clean and normalize keywords
+    keywords = [kw.strip() for kw in extracted_keywords if kw and len(kw.strip()) >= 3]
+    keywords = list(dict.fromkeys(keywords))[:20]  # deduplicate and cap
+
+    # Build queries from keywords
+    for kw in keywords:
+        for domain in legal_domains:
+            base_queries.append(f"{kw} {domain}")
+
+    # Add student answer context if available
+    if student_answer:
+        context_snippet = student_answer[:300].strip().replace("\n", " ")
+        base_queries.append(f"({context_snippet}) {' OR '.join(legal_domains)}")
+
+    # Add extra user question if provided
+    if extra_user_q:
+        base_queries.append(f"{extra_user_q.strip()} {' OR '.join(legal_domains)}")
+
+    return base_queries
+
+def collect_corpus(student_answer: str,
+                   extracted_keywords: List[str],
+                   extra_user_q: str,
+                   max_fetch: int = 20,
+                   search_budget_s: float = 15.0,   # total time for searches
+                   fetch_budget_s: float = 12.0,    # total time for page fetches
+                   max_workers: int = 8             # concurrency
+                   ) -> List[Dict]:
+
+    # Seed URLs first (zero-cost)
     results = [{"title": "", "url": u} for u in SEED_URLS]
-    for q in build_queries(student_answer, extra_user_q):
-        results.extend(duckduckgo_search(q, max_results=5))
+
+    # Build fewer queries
+    queries = build_queries(student_answer, extracted_keywords, extra_user_q)
+
+    # ---- Concurrent search with wall-clock budget ----
+    within_budget = _time_budget(search_budget_s)
+    search_hits = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(duckduckgo_search, q, 5): q for q in queries}
+        for fut in as_completed(futs, timeout=search_budget_s + 2):
+            if not within_budget():
+                break
+            try:
+                search_hits.extend(fut.result() or [])
+            except Exception:
+                pass
+            if len(search_hits) >= 40:   # soft cap
+                break
+
+    results.extend(search_hits)
+
+    # Clean + keep allowed domains
     seen, cleaned = set(), []
     for r in results:
         url = r["url"]
@@ -1185,15 +1135,30 @@ def collect_corpus(student_answer: str, extra_user_q: str, max_fetch: int = 20) 
             continue
         seen.add(url)
         domain = urlparse(url).netloc.lower()
-        if not any(domain.endswith(d) for d in ALLOWED_DOMAINS):
-            continue
-        cleaned.append(r)
-    fetched = []
-    for r in cleaned[:max_fetch]:
-        pg = fetch_url(r["url"])
-        if pg["text"]:
-            pg["title"] = pg["title"] or r.get("title") or r["url"]
-            fetched.append(pg)
+        if any(domain.endswith(d) for d in ALLOWED_DOMAINS):
+            cleaned.append(r)
+
+    # ---- Concurrent page fetch with wall-clock budget ----
+    fetched, within_budget = [], _time_budget(fetch_budget_s)
+    to_fetch = cleaned[:max_fetch]
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(fetch_url, r["url"]): r for r in to_fetch}
+        for fut in as_completed(futs, timeout=fetch_budget_s + 2):
+            if not within_budget():
+                break
+            try:
+                pg = fut.result()
+                if pg.get("text"):
+                    # carry over title if fetch_url didn't set one
+                    r = futs[fut]
+                    if not pg.get("title"):
+                        pg["title"] = r.get("title") or r["url"]
+                    fetched.append(pg)
+            except Exception:
+                pass
+            if len(fetched) >= max_fetch:
+                break
+
     return fetched
 
 # ---- Booklet relevance terms per question ----
@@ -1348,33 +1313,29 @@ def call_groq(messages: List[Dict], api_key: str, model_name=None,
 def system_guardrails():
     return (
         "You are a careful EU/German capital markets law tutor.\n"
-        "PRIORITY RULES:\n"
-        "1. Base all feedback on the authoritative MODEL ANSWER and the numbered SOURCES provided.\n"
-        "2. If SOURCES conflict with MODEL ANSWER, follow the MODEL ANSWER and briefly explain why.\n"
-        "3. Never reveal or mention that a hidden model answer exists.\n\n"
-        "4. If asked to reveal model answer, politely decline.\n\n"
-        "CITATIONS POLICY:\n"
-        "- Cite ONLY using numeric brackets that match the SOURCES list (e.g., [1], [2]).\n"
-        "- NEVER write the literal placeholder “[n]”.\n"
-        "- Never invent Course Booklet references (pages, paragraphs, cases). Only cite the numbered SOURCES.\n\n"
-        "- Do NOT fabricate page/para/case numbers.\n"
-        "- Do not cite any material that does not appear in the SOURCES list.\n\n"
+        "HARD RULES:\n"
+        "• Base feedback on the AUTHORITATIVE MODEL_ANSWER; do not contradict it.\n"
+        "• If student reasoning conflicts, state the correct conclusion first and explain briefly.\n"
+        "• Do not disclose or refer to any internal reference material.\n"
+        "\n"
+        "CITATIONS:\n"
+        "• Cite ONLY using numeric brackets [n] that refer to the provided SOURCES.\n"
+        "• Only use [n] if the corresponding EXCERPT [n] actually supports the claim.\n"
+        "• Do NOT fabricate Course Booklet references.\n"
+        "\n"
         "FEEDBACK PRINCIPLES:\n"
-        "- If the student's answer substantially aligns with the MODEL ANSWER, do not mark core claims as incorrect; prefer 'Correct' and offer improvements."
-        "- If the student's conclusion is incorrect, explicitly state the correct conclusion first, then explain why with citations [n].\n"
-        "- If the student's answer is irrelevant to the selected question, say: 'Are you sure your answer corresponds to the question you selected?'\n"
-        "- If central concepts are missing, point this out and explain why they matter.\n"
-        "- Correct mis-citations succinctly (e.g., Art 3(1) PR → Art 3(3) PR; §40 WpHG → §43(1) WpHG).\n"
-        "- Summarize or paraphrase concepts; do not copy long passages.\n\n"
-        "FACT-CHECKING RULE:\\n"
-        "- Do **not** mark something as 'Missing' if it appears in the PRESENT list provided in the prompt.\\n\\n"
-        "OUTPUT LAYOUT:\\n"
-        "- If you return a list of bullets, return a new line for each bullet."
-        "STYLE:\n"
-        "- Be concise, didactic, and actionable.\n"
-        "- Use ≤400 words, no new sections.\n"
-        "- Finish with a single explicit concluding sentence.\n"
-        "- Write in the same language as the student's answer when possible (if mixed, default to English)."
+        "• If the student substantially aligns with the MODEL_ANSWER, mark claims as Correct and put extras under Suggestions.\n"
+        "• If central concepts are missing, explain why they matter; correct mis-citations succinctly.\n"
+        "• Summarise—do not copy long passages.\n"
+        "\n"
+        "OUTPUT:\n"
+        "• ≤400 words, concise, didactic, actionable; same language as the student.\n"
+        "• Headings must be exactly:\n"
+        "**Student's Core Claims:**\n"
+        "**Mistakes:**\n"
+        "**Missing Aspects:**\n"
+        "**Suggestions:**\n"
+        "**Conclusion:**\n"
     )
 
 def _flatten_hits_misses_from_rubric(rubric: dict) -> tuple[list[str], list[str]]:
@@ -1399,85 +1360,63 @@ def _flatten_hits_misses_from_rubric(rubric: dict) -> tuple[list[str], list[str]
     # Keep lists reasonably short for the prompt
     return present[:30], missing[:30]
 
-def build_feedback_prompt(student_answer: str, rubric: dict, model_answer: str, sources_block: str, excerpts_block: str) -> str:
-    """
-    Prompt for LLM to generate feedback in 5 structured sections:
-    - Student's Core Claims
-    - Mistakes
-    - Missing Aspects
-    - Suggestions
-    - Conclusion
-    """
+def build_feedback_prompt(student_answer, rubric, model_answer, sources_block, excerpts_block):
+    has_sources = sources_block and "(no web sources available)" not in sources_block
+    citation_rule = (
+        "Use numeric citations [n] only from SOURCES, and only when the EXCERPT [n] supports the claim."
+        if has_sources else
+        "No numeric citations are available for this reply; write without [n] citations."
+    )
+
     issue_names = [row["issue"] for row in rubric.get("per_issue", [])]
     present = [kw for row in rubric.get("per_issue", []) for kw in row.get("keywords_hit", [])]
     missing = [kw for m in rubric.get("missing", []) for kw in m.get("missed_keywords", [])]
     present_block = "• " + "\n• ".join(present) if present else "—"
     missing_block = "• " + "\n• ".join(missing) if missing else "—"
-    exclusion_block = ""
-    excluded = rubric.get("excluded_keywords", [])
-    if excluded:
-        exclusion_block = (
-            "\nEXCLUSION RULE:\n"
-            "The following provisions are explicitly marked in the MODEL ANSWER as not required for this question:\n"
-            + "\n".join(f"- {kw}" for kw in excluded)
-            + "\nIf the student does not mention them, do not include them in 'Missing Aspects'.\n"
-            + "If the student does mention them, evaluate correctness and include feedback if appropriate."
-        )
-    
+
     return f"""
 GRADE THE STUDENT'S ANSWER USING THE RUBRIC AND THE WEB/BOOKLET SOURCES.
-{exclusion_block}
 
 STUDENT ANSWER:
 \"\"\"{student_answer}\"\"\"
 
 RUBRIC SUMMARY:
-- Similarity to model answer: {rubric.get('similarity_pct', 0)}%
-- Issue coverage: {rubric.get('coverage_pct', 0)}%
+- Similarity: {rubric.get('similarity_pct', 0)}%
+- Coverage: {rubric.get('coverage_pct', 0)}%
 - Overall score: {rubric.get('final_score', 0)}%
 - Issues to cover: {", ".join(issue_names) if issue_names else "—"}
 
-MODEL ANSWER (AUTHORITATIVE):
+MODEL ANSWER (authoritative):
 \"\"\"{model_answer}\"\"\"
 
-SOURCES (numbered; cite using [1], [2], … ONLY from this list):
+SOURCES (numbered):
 {sources_block}
 
-EXCERPTS (quote sparingly; cite using [1], [2], …):
+EXCERPTS (quote sparingly):
 {excerpts_block}
 
 AUTO-DETECTED EVIDENCE:
-- PRESENT in student's answer (DO NOT MARK THESE AS MISTAKES or MISSING ASPECTS):
+- PRESENT (do NOT mark these as Mistakes/Missing): 
 {present_block}
-
-- POTENTIALLY MISSING (only mark as missing if truly absent AND material):
+- POTENTIALLY MISSING (mark only if truly absent and material):
 {missing_block}
 
-OUTPUT FORMAT (use EXACTLY these headings):
-
+OUTPUT FORMAT (exact headings and bulleting):
 **Student's Core Claims:**
 • <claim> — [Correct|Incorrect|Not supported]
-
 **Mistakes:**
-• <incorrect claim> — Explanation of why it is incorrect [n]
-
+• <incorrect claim> — short why [n]
 **Missing Aspects:**
-• <missing concept> — Explanation of why it matters [n]
-
-**Suggestions**
-• <optional suggestion to improve clarity or depth> [n]
-
+• <missing concept> — why it matters [n]
+**Suggestions:**
+• <optional improvements> [n]
 **Conclusion:**
-<one-sentence summary>
+<one sentence>
 
 RULES:
-- Do NOT mark anything as missing if it appears in the PRESENT list.
-- ALWAYS insert a line break after each heading. 
-- If you use bullets, you MUST insert a line break before each bullet.
-- Use numeric citations [n] only from SOURCES.
-- Do NOT fabricate citations or Course Booklet references.
-- Be concise, didactic, and actionable.
-- ≤400 words total.
+- {citation_rule}
+- Always insert a line break after each heading and before each bullet.
+- Be concise and actionable; ≤400 words total.
 """.strip()
 
 def lock_out_false_mistakes(reply: str, rubric: dict) -> str:
@@ -1596,7 +1535,6 @@ def parse_cited_indices(text: str) -> list[int]:
     except Exception:
         return []
 
-
 def filter_sources_by_indices(source_lines: list[str], used: list[int]) -> list[str]:
     """Return only those lines whose [n] was actually cited; preserve numbering."""
     if not used:
@@ -1608,7 +1546,6 @@ def filter_sources_by_indices(source_lines: list[str], used: list[int]) -> list[
     return out
 
 # Paragraph markers may appear as "para. 115", "paragraph 115", "Rn. 115", "[115]", "¶ 115"
-
 _para_patterns = [
     re.compile(r"\bpara(?:graph)?\.?\s*(\d{1,4})\b", re.I),
     re.compile(r"\brn\.?\s*(\d{1,4})\b", re.I),
@@ -1825,7 +1762,6 @@ st.session_state["selected_question"] = selected_question
 st.subheader("📝 Your Answer")
 student_answer = st.text_area("Write your solution here (≥ ~120 words).", height=260)
 
-
 # ------------- Actions -------------
 colA, colB = st.columns([1, 1])
 
@@ -1845,17 +1781,18 @@ with colA:
                     api_key,
                     DEFAULT_WEIGHTS
                 )
-
-                agreement = in_agreement_mode(rubric)
-                prelude = agreement_prompt_prelude(agreement)
                 
                 top_pages, source_lines = [], []
                 if enable_web:
-                    pages = collect_corpus(student_answer, "", max_fetch=22)
-                    top_pages, source_lines = retrieve_snippets_with_booklet(
-                        student_answer, model_answer_filtered, pages, backend, extracted_keywords,
-                        user_query="", top_k_pages=max_sources, chunk_words=170
-                    )
+                    pages = collect_corpus(student_answer, extracted_keywords, "", max_fetch=18)
+                    if not pages:
+                        # fall back to “no sources” quickly
+                        top_pages, source_lines = [], []
+                    else:
+                        top_pages, source_lines = retrieve_snippets_with_booklet(
+                            student_answer, model_answer_filtered, pages, backend, extracted_keywords,
+                            user_query="", top_k_pages=max_sources, chunk_words=170
+                        )                    
                     
             # Breakdown
             with st.expander("🔬 Issue-by-issue breakdown"):
@@ -1894,11 +1831,11 @@ with colA:
             
                 messages = [
                     {"role": "system", "content": system_guardrails()},
-                    {"role": "user", "content": prelude + hard_rule + build_feedback_prompt(
+                    {"role": "user", "content": hard_rule + build_feedback_prompt(
                         student_answer, rubric, model_answer_filtered, sources_block, excerpts_block
                     )},
                 ]
-            
+                            
                 reply = generate_with_continuation(
                     messages, api_key, model_name=model_name, temperature=temp,
                     first_tokens=1200, continue_tokens=350
@@ -1909,15 +1846,13 @@ with colA:
                     api_key,
                     model_name,
                 )
-                reply = merge_to_suggestions(reply, student_answer, activate=agreement)
                 reply = tidy_empty_sections(reply)
-                reply = add_good_catch_for_optionals(reply, rubric) 
                 reply = prune_redundant_improvements(student_answer, reply, rubric)
                 reply = lock_out_false_mistakes(reply, rubric)
                 reply = lock_out_false_missing(reply, rubric)
                 reply = format_feedback_and_filter_missing(reply, student_answer, model_answer_filtered, rubric)
                 reply = re.sub(r"\[(?:n|N)\]", "", reply or "")
-            
+                
                 used_idxs = parse_cited_indices(reply)
                 display_source_lines = filter_sources_by_indices(source_lines, used_idxs) or source_lines
             
@@ -1974,7 +1909,7 @@ with colB:
                 )
                 extracted_keywords = [kw for issue in extracted_issues for kw in issue.get("keywords", [])]
 
-                pages = collect_corpus(student_answer, user_q, max_fetch=20)
+                pages = collect_corpus(student_answer, extracted_keywords, user_q, max_fetch=20)
                 top_pages, source_lines = retrieve_snippets_with_booklet(
                     student_answer, model_answer_filtered, pages, backend, extracted_keywords,
                     user_query=user_q, top_k_pages=max_sources, chunk_words=170
@@ -2060,6 +1995,6 @@ with colB:
 
 st.divider()
 st.markdown(
-    "ℹ️ **Notes**: This app is authored by Stephan Balthasar. It provides feedback based on artificial intelligence and large language models, and as a result, answers can be inaccurate. " 
-    "Students are advised to use caution when using the feedback engine and chat functions."
+    "ℹ️ **Notes**: (c) 2025 by Stephan Balthasar. This app provides feedback based on artificial intelligence and large language models, and as a result, answers can be inaccurate. " 
+    "Students are advised to use caution when using the feedback engine and chat functions. App feedback must not be read as an indicator for grades in a real examination."
 )
