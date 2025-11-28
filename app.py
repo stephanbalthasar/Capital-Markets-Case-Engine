@@ -31,6 +31,8 @@ from typing import List, Dict, Any, Tuple, Union, IO
 from urllib.parse import quote_plus, urlparse
 
 BOOKLET = "assets/EUCapML - Course Booklet.docx"
+GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
+GIST_ID = st.secrets["GIST_ID"]
 
 # ---------------- Build fingerprint (to verify latest deployment) ----------------
 APP_HASH = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:10]
@@ -393,6 +395,49 @@ def get_model_answer_slice_and_issues(case_data: dict, selected_label: str, api_
         return model_answer_filtered, extracted_issues
 
 # ---------- Public helpers you will call from the app ----------
+
+def update_gist(new_entry):
+    """Append a new entry to the Gist without overwriting previous logs."""
+    # Fetch existing logs from Gist
+    url = f"https://api.github.com/gists/{GIST_ID}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    try:
+        r = requests.get(url, headers=headers)
+        if r.status_code == 200:
+            files = r.json().get("files", {})
+            content = files.get("logs.csv", {}).get("content", "")
+            existing_lines = [line for line in content.splitlines() if line.strip()]
+        else:
+            existing_lines = ["timestamp,event,role"]  # start with header if Gist empty
+    except Exception:
+        existing_lines = ["timestamp,event,role"]
+
+    # Append new entry
+    existing_lines.append(",".join(new_entry))
+
+    # Update Gist with combined content
+    payload = {"files": {"logs.csv": {"content": "\n".join(existing_lines)}}}
+    try:
+        r = requests.patch(url, headers=headers, data=json.dumps(payload))
+        if r.status_code != 200:
+            st.error(f"Gist update failed: {r.status_code} {r.text}")
+    except Exception as e:
+        st.error(f"Gist update error: {e}")
+
+def fetch_gist():
+    """Fetch logs from the Gist and return as list of rows."""
+    url = f"https://api.github.com/gists/{GIST_ID}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+    try:
+        r = requests.get(url, headers=headers)
+        if r.status_code == 200:
+            files = r.json().get("files", {})
+            content = files.get("logs.csv", {}).get("content", "")
+            return [line.split(",") for line in content.splitlines() if line.strip()]
+    except Exception as e:
+        st.error(f"Gist fetch error: {e}")
+    return []
+
 def _time_budget(seconds: float):
     start = time.monotonic()
     return lambda: time.monotonic() - start < seconds
@@ -1634,6 +1679,10 @@ st.set_page_config(
     initial_sidebar_state="collapsed",   # ← collapsed by default
 )
 
+# Ensure logs list exists for all roles
+if "logs" not in st.session_state:
+    st.session_state.logs = []
+
 # Student login
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -1659,8 +1708,10 @@ if not st.session_state.authenticated:
             st.session_state.authenticated = True
             st.session_state.role = "student"
             # Log student login
-            with open("logs.csv", "a", encoding="utf-8") as f:
-                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},LOGIN,{st.session_state.role}\n")
+            if "logs" not in st.session_state:
+                st.session_state.logs = []
+            update_gist([time.strftime("%Y-%m-%d %H:%M:%S"), "LOGIN", st.session_state.role])
+            
     elif pin_input == tutor_pin:
         st.success("PIN accepted. Click CONTINUE to proceed as tutor.")
         if st.button("Continue"):
@@ -1773,33 +1824,18 @@ with st.sidebar:
         st.exception(e)
 
     # --- Tutor Log Viewer ---
-    
     if st.session_state.get("role") == "tutor":
         st.subheader("📒 Log Book (last 7 days)")
-        log_path = "logs.csv"
-        login_count, answer_count = 0, 0
-        now = datetime.now()
-        seven_days_ago = now - timedelta(days=7)
-    
-        if os.path.exists(log_path):
-            with open(log_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    parts = line.strip().split(",")
-                    if len(parts) < 3:
-                        continue
-                    try:
-                        ts = datetime.strptime(parts[0], "%Y-%m-%d %H:%M:%S")
-                    except ValueError:
-                        continue
-                    if ts >= seven_days_ago:
-                        event_type = parts[1].strip().upper()
-                        if event_type == "LOGIN":
-                            login_count += 1
-                        elif event_type == "ANSWER":
-                            answer_count += 1
-    
-            st.metric("Student logins (7 days)", login_count)
-            st.metric("Answer submissions (7 days)", answer_count)
+        lines = fetch_gist()
+        if lines:
+            import pandas as pd
+            df = pd.DataFrame(lines, columns=["timestamp", "event", "role"])
+            st.dataframe(df)
+            # Summary metrics
+            login_count = len([row for row in lines if row[1].upper() == "LOGIN"])
+            answer_count = len([row for row in lines if row[1].upper() == "ANSWER"])
+            st.metric("Student logins", login_count)
+            st.metric("Answer submissions", answer_count)
         else:
             st.info("No logs yet.")
 
@@ -1928,8 +1964,7 @@ with colA:
                     st.markdown(reply)
                     # --- Log student answer and feedback ---
                     if st.session_state.role == "student":
-                        with open("logs.csv", "a", encoding="utf-8") as f:
-                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},ANSWER,{st.session_state.role}\n")
+                        update_gist([time.strftime("%Y-%m-%d %H:%M:%S"), "LOGIN", st.session_state.role])
                 else:
                     st.info("LLM unavailable. See corrections above and the issue breakdown.")
             else:
