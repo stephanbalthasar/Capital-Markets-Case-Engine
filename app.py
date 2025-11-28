@@ -17,6 +17,7 @@ import time
 
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
 from docx import Document
 from docx.text.paragraph import Paragraph
 from docx.table import Table, _Cell
@@ -58,6 +59,24 @@ def format_booklet_citation(meta: Dict[str, Any]) -> str:
 
 PARA_RE_DOTSAFE = re.compile(r"^(\d{1,4})\b(?!\.)")              # 12 but not 1.1
 CASE_RE = re.compile(r"^Case\s*Study\s*(\d{1,4})\b", re.I)
+
+
+# ---- Case repository (JSON) ----
+CASES_PATH = "cases.json"
+
+def load_cases(path: str = CASES_PATH) -> list[dict]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, list):
+                raise ValueError("cases.json must be a JSON array of case objects.")
+            return data
+    except FileNotFoundError:
+        st.error(f"cases.json not found at {path}. Please add it to the repository.")
+        st.stop()
+    except Exception as e:
+        st.error(f"Could not load cases.json: {e}")
+        st.stop()
 
 def _iter_block_items(parent):
     """
@@ -352,6 +371,27 @@ def load_booklet_anchors(docx_source: Union[str, IO[bytes]]) -> Tuple[List[Dict[
         })
     return records, chunks, metas
 
+
+# ---- Helpers for per-question model answers ----
+def get_question_labels(case_data: dict) -> list[str]:
+    """Return ['Question 1', 'Question 2', ...] based on question_count."""
+    n = int(case_data.get("question_count", 1))
+    return [f"Question {i+1}" for i in range(max(1, n))]
+
+def get_model_answer_slice_and_issues(case_data: dict, selected_label: str, api_key: str) -> tuple[str, list[dict]]:
+    """
+    Return the authoritative slice for the selected question and the extracted issues.
+    If model_answer_sections are missing, fall back to old slicer using model_answer_full or model_answer.
+    """
+    labels = get_question_labels(case_data)
+    idx = labels.index(selected_label) if selected_label in labels else 0
+
+    sections = case_data.get("model_answer_sections") or []
+    if sections and idx < len(sections):
+        model_answer_filtered = sections[idx].strip()
+        extracted_issues = extract_issues_from_model_answer(model_answer_filtered, api_key)
+        return model_answer_filtered, extracted_issues
+
 # ---------- Public helpers you will call from the app ----------
 def _time_budget(seconds: float):
     start = time.monotonic()
@@ -470,43 +510,7 @@ def split_into_chunks(text: str, max_words: int = 180):
     if cur: chunks.append(" ".join(cur))
     return chunks
 
-# ---------------- Case & Model Answer (YOUR CONTENT) ----------------
-CASE = """
-Neon AG is a German stock company (Aktiengesellschaft), the shares of which have been admitted to trading on the regulated market of the Frankfurt stock exchange for a number of years. Gerry is Neon’s CEO (Vorstandsvorsitzender) and holds 25% of Neon’s shares. Gerry wants Neon to develop a new business strategy. For this, Neon would have to buy IP licences for 2.5 billion euros but has no means to afford this. Unicorn plc is a competitor of Neon’s based in the UK and owns licences of the type needed for Neon’s plans. After confidential negotiations, Unicorn, Neon, and Gerry in his personal capacity enter into a “Cooperation Framework Agreement” (“CFA”) which names all three as parties and which has the following terms:
-1. Unicorn will transfer the licences to Neon by way of a capital contribution in kind (Sacheinlage). In return, Neon will increase its share capital by 30.1% and issue the new shares to Unicorn. The parties agree that the capital increase should take place within the next 6 months. 
-2. Unicorn and Gerry agree that, once the capital increase is complete, they will pre-align major decisions impacting Neon’s business strategy. Where they cannot agree on a specific measure, Gerry agrees to follow Unicorn’s instructions when voting at a shareholder meeting of Neon.
-As a result of the capital increase, Gerry will hold approximately 19% in Neon, and Unicorn 23%. Unicorn, Neon and Gerry know that the agreement will come as a surprise to Neon’s shareholders, in particular, because in previous public statements, Gerry had always stressed that he wanted Neon to remain independent. They expect that the new strategy is a “game-changer” for Neon and will change its strategic orientation permanently in a substantial way. 
-
-Questions:
-1. Does the conclusion of the CFA trigger capital market disclosure obligations for Neon? What is the timeframe for disclosure? Is there an option for Neon to delay disclosure?
-2. Unicorn wants the new shares to be admitted to trading on the regulated market in Frankfurt. Does this require a prospectus under the Prospectus Regulation? What type of information in connection with the CFA would have to be included in such a prospectus?
-3. What are the capital market law disclosure obligations that arise for Unicorn once the capital increase and admission to trading are complete and Unicorn acquires the new shares? Can Unicorn participate in Neon’s shareholder meetings if it does not comply with these obligations?
-
-Note:
-Your answer will not have to consider the SRD, §§ 111a–111c AktG, or EU capital market law that is not included in your permitted material. You may assume that Gerry and Neon have all corporate authorisations for the conclusion of the CFA and the capital increase.
-"""
-
-MODEL_ANSWER = """
-
-1.  Question 1 requires a discussion of whether the conclusion of the CFA triggers an obligation to publish “inside information” pursuant to article 17(1) MAR. 
-a)  On the facts of the case (i.e., new shareholder structure of Neon, combined influence of Gerry and Unicorn, substantial change of strategy, etc.), students would have to conclude that the conclusion of the CFA is inside information within the meaning of article 7(1)(a): 
-aa) It relates to an issuer (Neon) and has not yet been made public.
-bb) Even if the agreement depends on further implementing steps, it creates information of a precise nature within the meaning of article 7(2) MAR in that there is an event that has already occurred – the conclusion of the CFA –, which is sufficient even if one considered it only as an “intermediate step” of a “protracted process”. In addition, subsequent events – the capital increase – can “reasonably be expected to occur” and therefore also qualify as information of a precise nature. A good answer would discuss the “specificity” requirement under article 7(2) MAR and mention that pursuant to the ECJ decision in Lafonta, it is sufficient for the information to be sufficiently specific to constitute a basis on which to assess the effect on the price of the financial instruments, and that the only information excluded by the specificity requirement is information that is “vague or general”. Also, the information is something a reasonable investor would likely use, and therefore likely to have a significant effect on prices within the meaning of article 7(4) MAR.
-cc) The information “directly concerns” the issuer in question. As a result, article 17(1) MAR requires Neon to “inform the public as soon as possible”. Students should mention that this allows issuers some time for fact-finding, but otherwise, immediate disclosure is required. Delay is only possible under article 17(4) MAR. However, there is nothing to suggest that Neon has a legitimate interest within the meaning of article 17(4)(a), and at any rate, given previous communication by Neon, a delay would be likely to mislead the public within the meaning of article 17(4)(b). Accordingly, a delay could not be justified under article 17(4) MAR.
-Students are not expected to address §§ 33, 38 WpHG. In fact, subscribing to new shares not yet issued (as done in the CFA) does not trigger any disclosure obligations under §§ 38(1), 33(3) WpHG. At any rate, these would only be incumbent on Unicorn, not Neon. 
-
-2.  Question 2 requires an analysis of prospectus requirements under the Prospectus Regulation.
-a)  There is no public offer within the meaning of article 2(d) PR that would trigger a prospectus requirement under article 3(1) PR. However, pursuant to article 3(3) PR, admission of securities to trading on a regulated market requires prior publication of a prospectus. Neon shares qualify as securities under article 2(a) PR in conjunction with article 4(1)(44) MiFID II. Students should discuss the fact that there is an exemption for this type of transaction under article 1(5)(a) PR, but that the exemption is limited to a capital increase of 20% or less so does not cover Neon’s case. Accordingly, admission to trading requires publication of a prospectus (under article 21 PR), which in turn makes it necessary to have the prospectus approved under article 20(1) PR). A very complete answer would mention that Neon could benefit from the simplified disclosure regime for secondary issuances under article 14(1)(a) PR.
-b)  As regards the content of the prospectus, students are expected to explain that the prospectus would have to include all information in connection with the CFA that is material within the meaning of article 6(1) PR, in particular, as regards the prospects of Neon (article 6(1)(1)(a) PR) and the reasons for the issuance (article 6(1)(1)(c) PR). The prospectus would also have to describe material risks resulting from the CFA and the new strategy (article 16(1) PR). A good answer would mention that the “criterion” for materiality under German case law is whether an investor would “rather than not” use the information for the investment decision.
-
-3.  The question requires candidates to address disclosure obligations under the Transparency Directive and the Takeover Bid Directive and implementing domestic German law. 
-a)  As Neon’s shares are listed on a regulated market, Neon is an issuer within the meaning of § 33(4) WpHG, so participations in Neon are subject to disclosure under §§33ff. WpHG. Pursuant to § 33(1) WpHG, Unicorn will have to disclose the acquisition of its stake in Neon. The relevant position to be disclosed includes the 23% stake held by Unicorn directly. In addition, Unicorn will have to take into account Gerry’s 19% stake if the CFA qualifies as “acting in concert” within the meaning of § 34(2) WpHG. In this context, students should differentiate between the two types of acting in concert, namely (i) an agreement to align the exercise of voting rights which qualifies as acting in concert irrespectively of the impact on the issuer’s strategy, and (ii) all other types of alignment which only qualify as acting in concert if it is aimed at modifying substantially the issuer’s strategic orientation. On the facts of the case, both requirements are fulfilled. A good answer should discuss this in the light of the BGH case law, and ideally also consider whether case law on acting in concert under WpÜG can and should be used to assess acting in concert under WpHG. A very complete answer would mention that Unicorn also has to make a statement of intent pursuant to § 43(1) WpHG.
-b)  The acquisition of the new shares is also subject to WpÜG requirements pursuant to § 1(1) WpÜG as the shares issued by Neon are securities within the meaning of § 2(2) WpÜG and admitted to trading on a regulated market. Pursuant to § 35(1)(1) WpÜG, Unicorn has to disclose the fact that it acquired “control” in Neon and publish an offer document submit a draft offer to BaFin, §§ 35(2)(1), 14(2)(1) WpÜG. “Control” is defined as the acquisition of 30% or more in an issuer, § 29(2) WpÜG. The 23% stake held by Unicorn directly would not qualify as “control" triggering a mandatory bid requirement. However, § 30(2) WpÜG requires to include in the calculation shares held by other parties with which Unicorn is acting in concert, i.e., Gerry’s 19% stake (students may refer to the discussion of acting in concert under § 34(2) WpHG). The relevant position totals 42% and therefore the disclosure requirements under § 35(1) WpÜG.
-c)  Failure to disclose under § 33 WpHG/§ 35 WpÜG will suspend Unicorn’s shareholder rights under § 44 WpHG, § 59 WpÜG. No such sanction exists as regards failure to make a statement of intent under § 43(1) WpHG.
-"""
-
 # ---------------- Scoring Rubric ----------------
-
 # ---------- Helpers for robust JSON extraction ----------
 def _first_json_block(s: str):
     """Extract the first JSON object/array from a string (handles ```json ... ```)."""
@@ -1094,39 +1098,45 @@ def build_queries(student_answer: str,
 
     return base_queries
 
-def collect_corpus(student_answer: str,
-                   extracted_keywords: List[str],
-                   extra_user_q: str,
-                   max_fetch: int = 20,
-                   search_budget_s: float = 15.0,   # total time for searches
-                   fetch_budget_s: float = 12.0,    # total time for page fetches
-                   max_workers: int = 8             # concurrency
-                   ) -> List[Dict]:
 
-    # Seed URLs first (zero-cost)
+def collect_corpus(
+    student_answer: str,
+    extracted_keywords: List[str],
+    extra_user_q: str,
+    max_fetch: int = 18,
+    search_budget_s: float = 15.0,
+    fetch_budget_s: float = 12.0,
+    max_workers: int = 6
+) -> List[Dict]:
+    # Seed URLs first
     results = [{"title": "", "url": u} for u in SEED_URLS]
 
-    # Build fewer queries
+    # Build queries and cap them
     queries = build_queries(student_answer, extracted_keywords, extra_user_q)
+    queries = queries[:8]  # ✅ Limit to top 8 queries
 
-    # ---- Concurrent search with wall-clock budget ----
+    # --- Concurrent search ---
     within_budget = _time_budget(search_budget_s)
     search_hits = []
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(duckduckgo_search, q, 5): q for q in queries}
-        for fut in as_completed(futs, timeout=search_budget_s + 2):
-            if not within_budget():
-                break
-            try:
-                search_hits.extend(fut.result() or [])
-            except Exception:
-                pass
-            if len(search_hits) >= 40:   # soft cap
-                break
+
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(duckduckgo_search, q, 5): q for q in queries}
+            for fut in as_completed(futs, timeout=search_budget_s + 10):  # ✅ Increased timeout
+                if not within_budget():
+                    break
+                try:
+                    search_hits.extend(fut.result() or [])
+                except Exception:
+                    pass
+                if len(search_hits) >= 40:
+                    break
+    except TimeoutError:
+        st.warning("⚠️ Search timed out. Using partial results.")
 
     results.extend(search_hits)
 
-    # Clean + keep allowed domains
+    # Filter allowed domains
     seen, cleaned = set(), []
     for r in results:
         url = r["url"]
@@ -1137,27 +1147,29 @@ def collect_corpus(student_answer: str,
         if any(domain.endswith(d) for d in ALLOWED_DOMAINS):
             cleaned.append(r)
 
-    # ---- Concurrent page fetch with wall-clock budget ----
+    # --- Concurrent fetch ---
     fetched, within_budget = [], _time_budget(fetch_budget_s)
     to_fetch = cleaned[:max_fetch]
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(fetch_url, r["url"]): r for r in to_fetch}
-        for fut in as_completed(futs, timeout=fetch_budget_s + 2):
-            if not within_budget():
-                break
-            try:
-                pg = fut.result()
-                if pg.get("text"):
-                    # carry over title if fetch_url didn't set one
-                    r = futs[fut]
-                    if not pg.get("title"):
-                        pg["title"] = r.get("title") or r["url"]
-                    fetched.append(pg)
-            except Exception:
-                pass
-            if len(fetched) >= max_fetch:
-                break
 
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(fetch_url, r["url"]): r for r in to_fetch}
+            for fut in as_completed(futs, timeout=fetch_budget_s + 10):  # ✅ Increased timeout
+                if not within_budget():
+                    break
+                try:
+                    pg = fut.result()
+                    if pg.get("text"):
+                        r = futs[fut]
+                        if not pg.get("title"):
+                            pg["title"] = r.get("title") or r["url"]
+                        fetched.append(pg)
+                except Exception:
+                    pass
+                if len(fetched) >= max_fetch:
+                    break
+    except TimeoutError:
+        st.warning("⚠️ Fetch timed out. Using partial results.")
     return fetched
 
 # ---- Booklet relevance terms per question ----
@@ -1169,7 +1181,7 @@ def booklet_chunk_relevant(text: str, extracted_keywords: list[str], user_query:
 
 def retrieve_snippets_with_booklet(student_answer, model_answer_filtered, pages, backend,
                                   extracted_keywords, user_query: str = "",
-                                  top_k_pages=8, chunk_words=170):
+                                  top_k_pages=8, chunk_words=170, docx_source=BOOKLET):
     booklet_chunks, booklet_metas = [], []
     try:
         booklet_chunks, booklet_metas = parse_booklet_docx(docx_source)         
@@ -1633,20 +1645,27 @@ if not st.session_state.authenticated:
             st.image("assets/logo.png", width=240)
         with title_col:
             st.title("EUCapML Case Tutor")
-    
+    # --- Login Block ---
     pin_input = st.text_input("Enter your password", type="password")
-
     try:
-        correct_pin = st.secrets["STUDENT_PIN"]
+        student_pin = st.secrets["STUDENT_PIN"]
+        tutor_pin = st.secrets["TUTOR_PIN"]
     except KeyError:
-        st.error("STUDENT_PIN not found in secrets. Please configure it in .streamlit/secrets.toml.")
+        st.error("PINs not found in secrets. Please configure STUDENT_PIN and TUTOR_PIN in .streamlit/secrets.toml.")
         st.stop()
-
-    if pin_input == correct_pin:
-        st.session_state.authenticated = True
-        st.success("PIN accepted. By clicking CONTINUE below you accept that this tool uses artificial intelligence and large language models, and that accordingly, answers may not be accurate. No liability is accepted for use of this tool.")
+    if pin_input == student_pin:
+        st.success("PIN accepted. By clicking CONTINUE below you accept that this tool uses AI and answers may not be accurate. No liability is accepted.")
         if st.button("Continue"):
-            st.rerun()
+            st.session_state.authenticated = True
+            st.session_state.role = "student"
+            # Log student login
+            with open("logs.csv", "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},LOGIN\n")
+    elif pin_input == tutor_pin:
+        st.success("PIN accepted. Click CONTINUE to proceed as tutor.")
+        if st.button("Continue"):
+            st.session_state.authenticated = True
+            st.session_state.role = "tutor"
     elif pin_input:
         st.error("Incorrect PIN. Please try again.")
     st.stop()
@@ -1753,22 +1772,60 @@ with st.sidebar:
     except Exception as e:
         st.exception(e)
 
+    # --- Tutor Log Viewer ---
+    
+    if st.session_state.get("role") == "tutor":
+        st.subheader("📒 Log Book (last 7 days)")
+        log_path = "logs.csv"
+        login_count, answer_count = 0, 0
+        now = datetime.now()
+        seven_days_ago = now - timedelta(days=7)
+    
+        if os.path.exists(log_path):
+            with open(log_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split(",")
+                    if len(parts) < 3:
+                        continue
+                    try:
+                        ts = datetime.strptime(parts[0], "%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        continue
+                    if ts >= seven_days_ago:
+                        event_type = parts[1].strip().upper()
+                        if event_type == "LOGIN":
+                            login_count += 1
+                        elif event_type == "ANSWER":
+                            answer_count += 1
+    
+            st.metric("Student logins (7 days)", login_count)
+            st.metric("Answer submissions (7 days)", answer_count)
+        else:
+            st.info("No logs yet.")
+
 # Main UI
+# Load case data
+cases = load_cases()
+case_titles = [c.get("title", f"Case {i+1}") for i, c in enumerate(cases)]
+
 st.image("assets/logo.png", width=240)
 st.title("EUCapML Case Tutor")
 
-with st.expander("📚 Case (click to read)"):
-    st.write(CASE)
+# Case picker
+selected_case_title = st.selectbox("🗂️ Select a case", case_titles, index=0)
+case_data = next(c for c in cases if c.get("title") == selected_case_title)
+st.subheader("📘 Case")
+st.write(case_data.get("description", ""))
 
-selected_question = st.selectbox(
+st.subheader("📝 Student answer and feedback engine")
+# Question picker (dynamic per case)
+question_labels = get_question_labels(case_data)
+selected_question_label = st.selectbox(
     "Which question are you answering?",
-    options=["Question 1", "Question 2", "Question 3"],
-    index=0,
-    help="This limits feedback to the selected question only."
+    question_labels,
+    index=0
 )
-st.session_state["selected_question"] = selected_question
-
-st.subheader("📝 Your Answer")
+st.session_state["selected_question"] = selected_question_label
 student_answer = st.text_area("Write your solution here (≥ ~120 words).", height=260)
 
 # ------------- Actions -------------
@@ -1781,7 +1838,9 @@ with colA:
         else:
             with st.spinner("Scoring and collecting sources..."):
                 backend = load_embedder()
-                model_answer_filtered, extracted_issues = filter_model_answer_and_rubric(selected_question, MODEL_ANSWER, api_key)
+                model_answer_filtered, extracted_issues = get_model_answer_slice_and_issues(
+                    case_data, selected_question_label, api_key
+                )
                 extracted_keywords = [kw for issue in extracted_issues for kw in issue.get("keywords", [])]
                 rubric = generate_rubric_from_model_answer(
                     student_answer,
@@ -1867,6 +1926,11 @@ with colA:
             
                 if reply:
                     st.markdown(reply)
+                    # --- Log student answer and feedback ---
+                    if st.session_state.role == "student":
+                        with open("logs.csv", "a", encoding="utf-8") as f:
+                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},ANSWER\n")
+                   
                 else:
                     st.info("LLM unavailable. See corrections above and the issue breakdown.")
             else:
@@ -1911,9 +1975,9 @@ with colB:
             backend = load_embedder()
             top_pages, source_lines = [], []
             if enable_web:
-                model_answer_filtered, extracted_issues = filter_model_answer_and_rubric(
+                model_answer_filtered, extracted_issues = get_model_answer_slice_and_issues(
+                    case_data,
                     st.session_state.get("selected_question", "Question 1"),
-                    MODEL_ANSWER,
                     api_key
                 )
                 extracted_keywords = [kw for issue in extracted_issues for kw in issue.get("keywords", [])]
